@@ -10,6 +10,7 @@ import org.apache.hc.core5.http.io.entity.StringEntity
 import org.opensearch.alerting.ALERTING_BASE_URI
 import org.opensearch.alerting.ALWAYS_RUN
 import org.opensearch.alerting.AlertingRestTestCase
+import org.opensearch.alerting.EXPECTED_ALERTING_PLUGIN_NAMES
 import org.opensearch.alerting.makeRequest
 import org.opensearch.alerting.objectMap
 import org.opensearch.alerting.randomDocumentLevelMonitor
@@ -66,18 +67,27 @@ class AlertingBackwardsCompatibilityIT : AlertingRestTestCase() {
             val pluginNames = plugins.map { plugin -> plugin["name"] }.toSet()
             when (CLUSTER_TYPE) {
                 ClusterType.OLD -> {
-                    assertTrue(pluginNames.contains("opensearch-alerting"))
+                    assertTrue(
+                        "Expected one of $EXPECTED_ALERTING_PLUGIN_NAMES, but found $pluginNames",
+                        pluginNames.any { it in EXPECTED_ALERTING_PLUGIN_NAMES }
+                    )
                     createBasicMonitor()
                 }
                 ClusterType.MIXED -> {
-                    assertTrue(pluginNames.contains("opensearch-alerting"))
+                    assertTrue(
+                        "Expected one of $EXPECTED_ALERTING_PLUGIN_NAMES, but found $pluginNames",
+                        pluginNames.any { it in EXPECTED_ALERTING_PLUGIN_NAMES }
+                    )
                     verifyMonitorExists(ALERTING_BASE_URI)
                     // TODO: Need to move the base URI being used here into a constant and rename ALERTING_BASE_URI to
                     //  MONITOR_BASE_URI
                     verifyMonitorStats("/_plugins/_alerting")
                 }
                 ClusterType.UPGRADED -> {
-                    assertTrue(pluginNames.contains("opensearch-alerting"))
+                    assertTrue(
+                        "Expected one of $EXPECTED_ALERTING_PLUGIN_NAMES, but found $pluginNames",
+                        pluginNames.any { it in EXPECTED_ALERTING_PLUGIN_NAMES }
+                    )
                     verifyMonitorExists(ALERTING_BASE_URI)
                     // TODO: Change the next execution time of the Monitor manually instead since this inflates
                     //  the test execution by a lot (might have to wait for Job Scheduler plugin integration first)
@@ -114,15 +124,24 @@ class AlertingBackwardsCompatibilityIT : AlertingRestTestCase() {
             val pluginNames = plugins.map { plugin -> plugin["name"] }.toSet()
             when (CLUSTER_TYPE) {
                 ClusterType.OLD -> {
-                    assertTrue(pluginNames.contains("opensearch-alerting"))
+                    assertTrue(
+                        "Expected one of $EXPECTED_ALERTING_PLUGIN_NAMES, but found $pluginNames",
+                        pluginNames.any { it in EXPECTED_ALERTING_PLUGIN_NAMES }
+                    )
                     createDocLevelMonitor()
                 }
                 ClusterType.MIXED -> {
-                    assertTrue(pluginNames.contains("opensearch-alerting"))
+                    assertTrue(
+                        "Expected one of $EXPECTED_ALERTING_PLUGIN_NAMES, but found $pluginNames",
+                        pluginNames.any { it in EXPECTED_ALERTING_PLUGIN_NAMES }
+                    )
                     verifyMonitorExecutionSuccess()
                 }
                 ClusterType.UPGRADED -> {
-                    assertTrue(pluginNames.contains("opensearch-alerting"))
+                    assertTrue(
+                        "Expected one of $EXPECTED_ALERTING_PLUGIN_NAMES, but found $pluginNames",
+                        pluginNames.any { it in EXPECTED_ALERTING_PLUGIN_NAMES }
+                    )
                     verifyMonitorExecutionSuccess()
                 }
             }

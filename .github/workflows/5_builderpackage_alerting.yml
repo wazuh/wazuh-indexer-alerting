@@ -64,13 +64,16 @@ jobs:
         run: echo "version=$(jq -r .version<VERSION.json)" >> "$GITHUB_OUTPUT"
 
       - name: Build and Test
-        run: ./gradlew build "-Dversion=${{ steps.version.outputs.version }}" "-Drevision=${{ inputs.revision }}"
+        run: ./gradlew clean build "-Dversion=${{ steps.version.outputs.version }}" "-Drevision=${{ inputs.revision }}"
         shell: bash
 
       - name: Prepare Artifacts
         run: |
           mkdir -p build-artifacts
-          find . -type f \( -name "*.zip" -o -name "*.jar" \) -path "*/build/distributions/*" -o -path "*/build/libs/*" -exec cp -v {} build-artifacts/ \;
+          artifact_base="wazuh-indexer-alerting-${{ steps.version.outputs.version }}.${{ inputs.revision }}"
+          cp -v "alerting/build/distributions/${artifact_base}.jar" build-artifacts/
+          cp -v "alerting/build/distributions/${artifact_base}.zip" build-artifacts/
+          ls -lah build-artifacts
         shell: bash
 
       - name: Upload artifact
@@ -79,3 +82,4 @@ jobs:
           name: ${{ env.plugin_name }}-${{ steps.version.outputs.version }}.${{ inputs.revision }}-${{ matrix.os }}
           path: build-artifacts
           if-no-files-found: error
+          overwrite: true

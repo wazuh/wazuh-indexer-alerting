@@ -12,6 +12,7 @@ import org.opensearch.alerting.ALERTING_BASE_URI
 import org.opensearch.alerting.ALWAYS_RUN
 import org.opensearch.alerting.ANOMALY_DETECTOR_INDEX
 import org.opensearch.alerting.AlertingRestTestCase
+import org.opensearch.alerting.EXPECTED_ALERTING_PLUGIN_NAMES
 import org.opensearch.alerting.LEGACY_OPENDISTRO_ALERTING_BASE_URI
 import org.opensearch.alerting.alerts.AlertIndices
 import org.opensearch.alerting.anomalyDetectorIndexMapping
@@ -80,15 +81,18 @@ class MonitorRestApiIT : AlertingRestTestCase() {
     fun `test plugin is loaded`() {
         val response = entityAsMap(OpenSearchRestTestCase.client().makeRequest("GET", "_nodes/plugins"))
         val nodesInfo = response["nodes"] as Map<String, Map<String, Any>>
+        val discoveredPluginNames = mutableSetOf<String>()
         for (nodeInfo in nodesInfo.values) {
             val plugins = nodeInfo["plugins"] as List<Map<String, Any>>
             for (plugin in plugins) {
-                if (plugin["name"] == "opensearch-alerting") {
+                val pluginName = plugin["name"] as? String ?: continue
+                discoveredPluginNames.add(pluginName)
+                if (pluginName in EXPECTED_ALERTING_PLUGIN_NAMES) {
                     return
                 }
             }
         }
-        fail("Plugin not installed")
+        fail("Plugin not installed. Expected one of $EXPECTED_ALERTING_PLUGIN_NAMES, but found $discoveredPluginNames")
     }
 
     fun `test parsing monitor as a scheduled job`() {

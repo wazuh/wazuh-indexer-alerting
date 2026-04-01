@@ -481,6 +481,7 @@ fun randomEmailGroup(
 fun randomScript(source: String = "return " + OpenSearchRestTestCase.randomBoolean().toString()): Script = Script(source)
 
 val ADMIN = "admin"
+val EXPECTED_ALERTING_PLUGIN_NAMES = setOf("wazuh-indexer-alerting", "opensearch-alerting")
 val ALERTING_BASE_URI = "/_plugins/_alerting/monitors"
 val WORKFLOW_ALERTING_BASE_URI = "/_plugins/_alerting/workflows"
 val DESTINATION_BASE_URI = "/_plugins/_alerting/destinations"

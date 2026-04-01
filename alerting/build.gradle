@@ -51,7 +51,7 @@ ext {
 }
 
 opensearchplugin {
-    name 'opensearch-alerting'
+    name 'wazuh-indexer-alerting'
     description 'Amazon OpenSearch alerting plugin'
     classname 'org.opensearch.alerting.AlertingPlugin'
     extendedPlugins = ['lang-painless']
@@ -61,7 +61,7 @@ publishing {
     publications {
         pluginZip(MavenPublication) { publication ->
             pom {
-                name = "opensearch-alerting"
+                name = "wazuh-indexer-alerting"
                 description = "OpenSearch Alerting plugin"
                 groupId = "org.opensearch.plugin"
                 licenses {
