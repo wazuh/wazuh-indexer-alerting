@@ -20,7 +20,7 @@ Fork this repository on GitHub, and clone locally with `git clone`.
 
 #### JDK 21
 
-OpenSearch builds using Java 21 at a minimum, using the Adoptium distribution. This means you must have a JDK 21 installed with the environment variable `JAVA_HOME` referencing the path to Java home for your JDK 21 installation, e.g. `JAVA_HOME=/usr/lib/jvm/jdk-11`. This is configured in [buildSrc/build.gradle](buildSrc/build.gradle) and [distribution/tools/java-version-checker/build.gradle](distribution/tools/java-version-checker/build.gradle).
+OpenSearch builds using Java 21 at a minimum, using the Adoptium distribution. This means you must have a JDK 21 installed with the environment variable `JAVA_HOME` referencing the path to Java home for your JDK 21 installation, e.g. `JAVA_HOME=/usr/lib/jvm/jdk-11`. This is configured in [buildSrc/build.gradle](build.gradle).
 
 ```
 allprojects {
@@ -34,7 +34,7 @@ sourceCompatibility = JavaVersion.VERSION_21
 targetCompatibility = JavaVersion.VERSION_21
 ```
 
-Download Java 21 from [here](https://adoptium.net/releases.html?variant=openjdk21).
+Download Java 21 from [here](https://adoptium.net/es/temurin/releases?version=21&mode=filter&os=any&arch=any).
 
 ### Setup
 
@@ -139,6 +139,4 @@ Example running on ARM MacOS with local artifact:
 `./gradlew integTest -PnumNodes=3 -PcustomDistributionUrl=/Users/macos-user/OpenSearch/distribution/archives/darwin-arm64-tar/build/distributions/opensearch-min-2.5.0-SNAPSHOT-darwin-arm64.tar.gz`
 
 ### Backport
-
-- [Link to backport documentation](https://github.com/opensearch-project/opensearch-plugins/blob/main/BACKPORT.md)
-  
+ 
