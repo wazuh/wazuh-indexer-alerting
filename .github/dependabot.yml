@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - directory: core/src
+    open-pull-requests-limit: 0
+    package-ecosystem: gradle
+    schedule:
+      interval: weekly
+      day: "friday"
+  - directory: sample-remote-monitor-plugin/src
+    open-pull-requests-limit: 0
+    package-ecosystem: gradle
+    schedule:
+    interval: weekly
+    day: "friday"
+  - directory: spi/src
+    open-pull-requests-limit: 0
+    package-ecosystem: gradle
+    schedule:
+    interval: weekly
+    day: "friday"
+  - directory: /
+    package-ecosystem: github-actions
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "dependabot:"

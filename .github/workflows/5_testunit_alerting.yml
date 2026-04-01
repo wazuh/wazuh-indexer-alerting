@@ -9,7 +9,7 @@ jobs:
         java: [ 25 ]
     # This job runs on Linux
     runs-on: ubuntu-24.04
-    name: Build and test Common Utils with security-enabled
+    name: Build and test Alerting with security-enabled
     steps:
       # This step uses the setup-java Github action: https://github.com/actions/setup-java
       - name: Set Up JDK ${{ matrix.java }}

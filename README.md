@@ -1,56 +1,82 @@
-[![Test Workflow](https://github.com/opensearch-project/alerting/workflows/Test%20Workflow/badge.svg)](https://github.com/opensearch-project/alerting/actions)
-[![codecov](https://codecov.io/gh/opensearch-project/alerting/branch/main/graph/badge.svg)](https://codecov.io/gh/opensearch-project/alerting)
-[![Documentation](https://img.shields.io/badge/api-reference-blue.svg)](https://opensearch.org/docs/latest/monitoring-plugins/alerting/api/)
-[![Chat](https://img.shields.io/badge/chat-on%20forums-blue)](https://forum.opensearch.org/c/plugins/alerting/7)
-![PRs welcome!](https://img.shields.io/badge/PRs-welcome!-success)
+<p align="center">
+    <img width="640px" src="https://wazuh.com/brand-assets/Wazuh-Logo.svg"/>
+</p>
 
-<img src="https://opensearch.org/assets/brand/SVG/Logo/opensearch_logo_default.svg" height="64px"/>
+[![Chat](https://img.shields.io/badge/chat-on%20forums-blue)](https://groups.google.com/forum/#!forum/wazuh)
+[![Slack](https://img.shields.io/badge/slack-join-blue.svg)](https://wazuh.com/community/join-us-on-slack)
+[![Documentation](https://img.shields.io/badge/documentation-reference-blue)](https://documentation.wazuh.com)
 
-- [OpenSearch Alerting](#opensearch-alerting)
-- [Highlights](#highlights)
-- [Documentation](#documentation)
+- [Wazuh Indexer Alerting](#wazuh-indexer-alerting)
+- [Project Resources](#project-resources)
 - [Contributing](#contributing)
-- [Code of Conduct](#code-of-conduct)
 - [Security](#security)
 - [License](#license)
 - [Copyright](#copyright)
 
-# OpenSearch Alerting
+## Wazuh Indexer Alerting
 
-The OpenSearch Alerting enables you to monitor your data and send alert notifications automatically to your stakeholders. With an intuitive OpenSearch Dashboards interface and a powerful API, it is easy to set up, manage, and monitor your alerts. Craft highly specific alert conditions using Elasticsearch's full query language and scripting capabilities.
+The **Wazuh Indexer Alerting** enables you to monitor your data and send alert notifications automatically to your
+stakeholders. With an intuitive OpenSearch Dashboards interface and a powerful API, it is easy to set up, manage, and
+monitor your alerts. Craft highly specific alert conditions using Elasticsearch's full query language and scripting
+capabilities.
 
+This repository is an open-source fork of the [OpenSearch alerting](https://github.com/opensearch-project/alerting) project, adapted to ensure seamless integration within the Wazuh ecosystem.
 
-## Highlights
+### Key Components
 
-Scheduled searches use [cron expressions](https://en.wikipedia.org/wiki/Cron) or intervals (e.g. every five minutes) and the Elasticsearch query DSL.
+The **Wazuh Indexer Alerting** plugin is composed of the following modules:
 
-To define trigger conditions, use the Painless scripting language or simple thresholds (e.g. count > 100).
+1. **Alerting Core** (`core/`): Provides foundational functionality for scheduled job execution and coordination.
+   - Job scheduling and execution
+   - Periodic job sweeping and management
+   - Distributed locking mechanisms
+   - Common utilities and base classes
 
-When trigger conditions are met, you can publish messages to the following destinations:
+2. **Alerting Plugin** (`alerting/`): Main plugin module delivering monitoring and alerting capabilities.
+   - **Monitor Management**: Create, read, update, and delete monitoring rules with support for multiple monitor types
+   - **Workflow Orchestration**: Chain multiple monitors together for complex alerting workflows
+   - **Multi-Level Monitoring**: Support for query-level, document-level, bucket-level, and cluster metrics monitoring
+   - **Alert Management**: Comprehensive alert lifecycle management (creation, acknowledgment, resolution)
+   - **Destination Integration**: Email accounts, groups, and custom notification destinations
 
-* [Slack](https://slack.com/)
-* Custom webhook
-* [Amazon Chime](https://aws.amazon.com/chime/)
-* Email
+3. **Service Layer**: Core business logic and operations.
+   - `MonitorRunnerService`: Executes monitors on schedule
+   - `TriggerService`: Evaluates and manages trigger conditions
+   - `AlertService`: Manages alert state and lifecycle
+   - `DeleteMonitorService`: Handles monitor cleanup and deregistration
 
-Messages can be static strings, or you can use the [Mustache](https://mustache.github.io/mustache.5.html) templates to include contextual information.
+4. **REST API & Transport Layer**: API endpoints and inter-node communication.
+   - RESTful endpoints for monitor CRUD operations
+   - Workflow management endpoints
+   - Transport actions for distributed execution
+   - Support for both V1 and V2 API versions
 
+5. **SPI (Service Provider Interface)** (`spi/`): Extensibility mechanism for custom monitors.
+   - `RemoteMonitorRunnerExtension`: Allows third-party implementations of custom monitor types
+   - Enables plugin ecosystem integration
 
-## Documentation
+6. **Alert Indices**: Manages alert storage and metadata.
+   - Alert indexing and querying
+   - Comments and findings tracking
+   - Index lifecycle management for alert data
 
-Please see our [documentation](https://docs-beta.opensearch.org/monitoring-plugins/alerting/index/).
+## Project Resources
+
+* [Project Website](https://wazuh.com)
+* [Documentation](https://documentation.wazuh.com)
+* Need help? Try [Slack](https://wazuh.com/community/join-us-on-slack)
 
 ## Contributing
 
-See [developer guide](DEVELOPER_GUIDE.md) and [how to contribute to this project](CONTRIBUTING.md).
+See [CONTRIBUTING.md](./CONTRIBUTING.md) and join in. We welcome bug reports and feature requests through GitHub issues.
 
 ## Code of Conduct
 
-This project has adopted the [Amazon Open Source Code of Conduct](CODE_OF_CONDUCT.md). For more information see the [Code of Conduct FAQ](https://aws.github.io/code-of-conduct-faq), or contact [opensource-codeofconduct@amazon.com](mailto:opensource-codeofconduct@amazon.com) with any additional questions or comments.
+This project has adopted the [Amazon Open Source Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Security
 
-If you discover a potential security issue in this project we ask that you notify AWS/Amazon Security via our [vulnerability reporting page](http://aws.amazon.com/security/vulnerability-reporting/). Please do **not** create a public GitHub issue.
+To report a possible vulnerability or security issue, please email us at **security@wazuh.com** or open a report under the Security tab. **PLEASE DO NOT OPEN A PUBLIC ISSUE.**
 
 ## License
 
@@ -58,4 +84,4 @@ This project is licensed under the [Apache v2.0 License](LICENSE.txt).
 
 ## Copyright
 
-Copyright OpenSearch Contributors. See [NOTICE](NOTICE.txt) for details.
+Copyright Wazuh, Inc. (Original code Copyright OpenSearch Contributors). See [NOTICE](NOTICE) for details.
