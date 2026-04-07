@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- Add active response channel type [(#2)](https://github.com/wazuh/wazuh-indexer-common-utils/pull/2)
+- Repo initialization [(#2)](https://github.com/wazuh/wazuh-indexer-alerting/pull/2)
 
 ### Dependencies
 
