@@ -3,7 +3,7 @@ Depending on the plugin relationship with the Wazuh organization we currently re
 
 ### Official plugins
 
-For the **official plugins** that live within the Wazuh organization (i.e. they are included in [wazuh/wazuh-indexer-plugins/](https://github.com/wazuh/wazuh-indexer-plugins) or [wazuh/wazuh-indexer-reporting/](https://github.com/wazuh/wazuh-indexer-reporting) folder), and **which share the same release cycle as the Wazuh Indexer** itself:
+For the **official plugins** that live within the Wazuh organization (i.e. they are included in [wazuh/wazuh-indexer-plugins/](https://github.com/wazuh/wazuh-indexer-plugins) or [wazuh/wazuh-indexer-alerting/](https://github.com/wazuh/wazuh-indexer-alerting) folder), and **which share the same release cycle as the Wazuh Indexer** itself:
 
 - Do not include the word `plugin` in the repo name (e.g. [job-scheduler](https://github.com/opensearch-project/job-scheduler))
 - Use lowercase repo names

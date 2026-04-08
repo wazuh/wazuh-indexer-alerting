@@ -138,5 +138,4 @@ Example running on ARM MacOS with local artifact:
 
 `./gradlew integTest -PnumNodes=3 -PcustomDistributionUrl=/Users/macos-user/OpenSearch/distribution/archives/darwin-arm64-tar/build/distributions/opensearch-min-2.5.0-SNAPSHOT-darwin-arm64.tar.gz`
 
-### Backport
  

@@ -16,7 +16,7 @@
 ## Wazuh Indexer Alerting
 
 The **Wazuh Indexer Alerting** enables you to monitor your data and send alert notifications automatically to your
-stakeholders. With an intuitive OpenSearch Dashboards interface and a powerful API, it is easy to set up, manage, and
+stakeholders. With an intuitive Wazuh Dashboards interface and a powerful API, it is easy to set up, manage, and
 monitor your alerts. Craft highly specific alert conditions using Elasticsearch's full query language and scripting
 capabilities.
 
