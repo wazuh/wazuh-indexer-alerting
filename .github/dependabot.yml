@@ -10,14 +10,14 @@ updates:
     open-pull-requests-limit: 0
     package-ecosystem: gradle
     schedule:
-    interval: weekly
-    day: "friday"
+      interval: weekly
+      day: "friday"
   - directory: spi/src
     open-pull-requests-limit: 0
     package-ecosystem: gradle
     schedule:
-    interval: weekly
-    day: "friday"
+      interval: weekly
+      day: "friday"
   - directory: /
     package-ecosystem: github-actions
     schedule:
