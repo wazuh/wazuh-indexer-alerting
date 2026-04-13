@@ -60,10 +60,11 @@ opensearchplugin {
 publishing {
     publications {
         pluginZip(MavenPublication) { publication ->
+            groupId = "com.wazuh"
+            artifactId = "wazuh-indexer-alerting"
             pom {
                 name = "wazuh-indexer-alerting"
                 description = "OpenSearch Alerting plugin"
-                groupId = "org.opensearch.plugin"
                 licenses {
                     license {
                         name = "The Apache License, Version 2.0"
@@ -90,6 +91,14 @@ publishing {
                 sessionToken = System.getenv("AWS_SESSION_TOKEN")
             }
         }
+    }
+}
+
+// Keep an explicit post-configuration override because opensearch plugin wiring can reset publication coordinates.
+afterEvaluate {
+    publishing.publications.named("pluginZip", MavenPublication).configure {
+        groupId = "com.wazuh"
+        artifactId = "wazuh-indexer-alerting"
     }
 }
 

@@ -8,10 +8,10 @@ buildscript {
 
     ext {
         opensearch_version = System.getProperty("opensearch.version", "3.5.0-SNAPSHOT")
-        artifactVersion = System.getProperty("version", "")
-        artifactRevision = System.getProperty("revision", "0")
+        artifactVersion = System.getProperty("version", "5.0.0")
+        artifactRevision = System.getProperty("build.revision", System.getProperty("revision", "0"))
         buildVersionQualifier = System.getProperty("build.version_qualifier", "")
-        isSnapshotDefault = artifactVersion ? "false" : "true"
+        isSnapshotDefault = "false"
         isSnapshot = "true" == System.getProperty("build.snapshot", isSnapshotDefault)
 
         wazuh_version = System.getProperty("version", "5.0.0")
@@ -20,7 +20,7 @@ buildscript {
         // 3.0.0-SNAPSHOT -> 3.0.0.0-SNAPSHOT
         version_tokens = opensearch_version.tokenize('-')
         opensearch_build = version_tokens[0] + '.0'
-        artifact_version_tokens = (artifactVersion ?: opensearch_version).tokenize('-')
+        artifact_version_tokens = artifactVersion.tokenize('-')
         artifact_build = artifact_version_tokens[0]
         if (artifact_build.tokenize('.').size() == 3) {
             artifact_build += ".${artifactRevision}"
@@ -125,7 +125,7 @@ task ktlintFormat(type: JavaExec, group: "formatting") {
 check.dependsOn ktlint
 
 allprojects {
-    group = "org.opensearch"
+    group = "com.wazuh"
     version = "${plugin_no_snapshot}"
 
     apply from: "$rootDir/build-tools/repositories.gradle"
