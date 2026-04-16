@@ -51,7 +51,7 @@ ext {
 }
 
 opensearchplugin {
-    name 'opensearch-alerting'
+    name 'wazuh-indexer-alerting'
     description 'Amazon OpenSearch alerting plugin'
     classname 'org.opensearch.alerting.AlertingPlugin'
     extendedPlugins = ['lang-painless']
@@ -60,10 +60,11 @@ opensearchplugin {
 publishing {
     publications {
         pluginZip(MavenPublication) { publication ->
+            groupId = "com.wazuh"
+            artifactId = "wazuh-indexer-alerting"
             pom {
-                name = "opensearch-alerting"
+                name = "wazuh-indexer-alerting"
                 description = "OpenSearch Alerting plugin"
-                groupId = "org.opensearch.plugin"
                 licenses {
                     license {
                         name = "The Apache License, Version 2.0"
@@ -90,6 +91,14 @@ publishing {
                 sessionToken = System.getenv("AWS_SESSION_TOKEN")
             }
         }
+    }
+}
+
+// Keep an explicit post-configuration override because opensearch plugin wiring can reset publication coordinates.
+afterEvaluate {
+    publishing.publications.named("pluginZip", MavenPublication).configure {
+        groupId = "com.wazuh"
+        artifactId = "wazuh-indexer-alerting"
     }
 }
 
@@ -159,8 +168,8 @@ dependencies {
         opensearchPlugin "org.opensearch.plugin:opensearch-security:${opensearch_build}@zip"
     }
 
-    // Needed for BWC tests
-    opensearchPlugin "org.opensearch.plugin:alerting:${bwcPluginVersion}@zip"
+    // Needed for BWC tests (consumed by test cluster setup via zipArchive)
+    zipArchive group: 'org.opensearch.plugin', name:'alerting', version: "${bwcPluginVersion}"
 
     compileOnly "org.opensearch.plugin:opensearch-scripting-painless-spi:${versions.opensearch}"
     api "org.opensearch.plugin:percolator-client:${opensearch_version}"

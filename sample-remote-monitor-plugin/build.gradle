@@ -18,7 +18,7 @@ opensearchplugin {
     name 'sample-remote-monitor-plugin'
     description 'Sample plugin that extends OpenSearch Alerting plugin'
     classname 'org.opensearch.alerting.SampleRemoteMonitorPlugin'
-    extendedPlugins = ['opensearch-alerting']
+    extendedPlugins = ['wazuh-indexer-alerting']
 }
 
 ext {

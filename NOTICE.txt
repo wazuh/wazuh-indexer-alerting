@@ -1,3 +1,6 @@
+Wazuh (https://wazuh.com/)
+Copyright 2024-2026 Wazuh Inc.
+
 OpenSearch (https://opensearch.org/)
 Copyright OpenSearch Contributors
 
