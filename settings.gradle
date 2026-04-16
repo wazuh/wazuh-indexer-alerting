@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-rootProject.name = 'opensearch-alerting'
+rootProject.name = 'wazuh-indexer-alerting'
 include 'alerting'
 include 'core'
 include 'spi'

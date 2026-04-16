@@ -23,6 +23,7 @@ dependencies {
 }
 
 shadowJar {
+    archiveBaseName = 'wazuh-indexer-alerting-spi'
     archiveClassifier = null
 }
 
@@ -55,8 +56,8 @@ publishing {
     publications {
         shadow(MavenPublication) {
             from components.shadow
-            groupId = 'org.opensearch.alerting'
-            artifactId = 'alerting-spi'
+            groupId = 'com.wazuh'
+            artifactId = 'wazuh-indexer-alerting-spi'
 
             artifact sourcesJar
             artifact javadocJar
