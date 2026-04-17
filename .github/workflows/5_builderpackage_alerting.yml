@@ -43,6 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       common_utils_ref: ${{ steps.resolve.outputs.wazuh_indexer_common_utils_branch }}
+      common_utils_sha: ${{ steps.common-utils-sha.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
 
@@ -52,9 +53,16 @@ jobs:
         with:
           branch: ${{ github.ref_name }}
 
+      - name: Get common-utils latest commit
+        id: common-utils-sha
+        run: |
+          SHA=$(git ls-remote https://github.com/wazuh/wazuh-indexer-common-utils.git "${{ steps.resolve.outputs.wazuh_indexer_common_utils_branch }}" | cut -f1)
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Display resolved branches
         run: |
           echo "Common Utils branch: ${{ steps.resolve.outputs.wazuh_indexer_common_utils_branch }}"
+          echo "Common Utils SHA: ${{ steps.common-utils-sha.outputs.sha }}"
 
   get-version:
     runs-on: ubuntu-24.04
@@ -72,15 +80,16 @@ jobs:
     needs: [branches, get-version]
     steps:
       - name: Restore Maven Local Cache
+        id: cache-common-utils
         uses: actions/cache/restore@v5
         with:
           path: ~/.m2/repository
-          key: m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-${{ needs.get-version.outputs.version }}-r${{ inputs.revision }}
+          key: m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-${{ needs.branches.outputs.common_utils_sha }}-${{ needs.get-version.outputs.version }}-r${{ inputs.revision }}
           restore-keys: |
-            m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-
-            m2-common-utils-${{ github.ref_name }}-
+            m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-${{ needs.branches.outputs.common_utils_sha }}-
 
       - name: Publish to Maven Local
+        if: steps.cache-common-utils.outputs.cache-hit != 'true'
         uses: wazuh/wazuh-indexer-common-utils/.github/actions/5_local_maven_publisher@main
         with:
           version: ${{ needs.get-version.outputs.version }}
@@ -88,10 +97,11 @@ jobs:
           reference: ${{ needs.branches.outputs.common_utils_ref }}
 
       - name: Cache Maven Local
+        if: steps.cache-common-utils.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
           path: ~/.m2/repository
-          key: m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-${{ needs.get-version.outputs.version }}-r${{ inputs.revision }}
+          key: m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-${{ needs.branches.outputs.common_utils_sha }}-${{ needs.get-version.outputs.version }}-r${{ inputs.revision }}
 
   build:
     env:
@@ -111,7 +121,9 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ~/.m2/repository
-          key: m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-${{ needs.get-version.outputs.version }}-r${{ inputs.revision }}
+          key: m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-${{ needs.branches.outputs.common_utils_sha }}-${{ needs.get-version.outputs.version }}-r${{ inputs.revision }}
+          restore-keys: |
+            m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-${{ needs.branches.outputs.common_utils_sha }}-
 
       - name: Build and Test
         run: ./gradlew build "-Dversion=${{ needs.get-version.outputs.version }}" "-Dbuild.revision=${{ inputs.revision }}" -x integTest
