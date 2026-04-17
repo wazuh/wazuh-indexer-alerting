@@ -22,9 +22,9 @@ buildscript {
         opensearch_build = version_tokens[0] + '.0'
         artifact_version_tokens = artifactVersion.tokenize('-')
         artifact_build = artifact_version_tokens[0]
-        if (artifact_build.tokenize('.').size() == 3) {
-            artifact_build += ".${artifactRevision}"
-        }
+        //if (artifact_build.tokenize('.').size() == 3) {
+        //    artifact_build += ".${artifactRevision}"
+        //}
         plugin_no_snapshot = artifact_build
         if (buildVersionQualifier) {
             opensearch_build += "-${buildVersionQualifier}"
@@ -34,7 +34,7 @@ buildscript {
             plugin_no_snapshot += "-SNAPSHOT"
         }
         opensearch_no_snapshot = opensearch_version.replace("-SNAPSHOT","")
-        common_utils_version = System.getProperty("common_utils.version", "${wazuh_version}.${revision}")
+        common_utils_version = System.getProperty("common_utils.version", "${wazuh_version}")
         kotlin_version = '2.2.0'
     }
 
