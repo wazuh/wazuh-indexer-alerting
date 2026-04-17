@@ -39,7 +39,7 @@ configurations {
 
 dependencies {
     compileOnly project(path: ":alerting-spi", configuration: 'shadow')
-    compileOnly "org.opensearch:common-utils:${common_utils_version}@jar"
+    compileOnly "com.wazuh:wazuh-indexer-common-utils:${common_utils_version}@jar"
     compileOnly "com.cronutils:cron-utils:9.1.7"
     compileOnly "org.jetbrains.kotlin:kotlin-stdlib:${kotlin_version}"
     compileOnly 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.1.1'
