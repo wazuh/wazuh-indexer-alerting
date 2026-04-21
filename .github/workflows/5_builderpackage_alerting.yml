@@ -114,7 +114,7 @@ jobs:
           key: m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-${{ needs.get-version.outputs.version }}-r${{ inputs.revision }}
 
       - name: Build and Test
-        run: ./gradlew build "-Dversion=${{ needs.get-version.outputs.version }}" "-Dbuild.revision=${{ inputs.revision }}" -x integTest
+        run: ./gradlew build "-Dversion=${{ needs.get-version.outputs.version }}" "-Drevision=${{ inputs.revision }}" -x integTest
         shell: bash
 
       - name: Prepare Artifacts
