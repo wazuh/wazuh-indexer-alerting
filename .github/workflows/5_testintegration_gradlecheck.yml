@@ -84,5 +84,5 @@ jobs:
           key: m2-common-utils-${{ github.ref_name }}-${{ needs.branches.outputs.common_utils_ref }}-${{ needs.get-version.outputs.version }}-r0
 
       - name: Run Gradle check
-        run: ./gradlew check "-Dversion=${{ needs.get-version.outputs.version }}" "-Dbuild.revision=0"
+        run: ./gradlew check "-Dversion=${{ needs.get-version.outputs.version }}" "-Drevision=0"
         shell: bash
