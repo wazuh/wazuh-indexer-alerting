@@ -8,21 +8,33 @@ buildscript {
 
     ext {
         opensearch_version = System.getProperty("opensearch.version", "3.6.0-SNAPSHOT")
+        artifactVersion = System.getProperty("version", "5.0.0")
+        artifactRevision = System.getProperty("revision", "0")
         buildVersionQualifier = System.getProperty("build.version_qualifier", "")
-        isSnapshot = "true" == System.getProperty("build.snapshot", "true")
+        isSnapshotDefault = "false"
+        isSnapshot = "true" == System.getProperty("build.snapshot", isSnapshotDefault)
+
+        wazuh_version = System.getProperty("version", "5.0.0")
+        revision = System.getProperty("revision", "0")
+
         // 3.0.0-SNAPSHOT -> 3.0.0.0-SNAPSHOT
         version_tokens = opensearch_version.tokenize('-')
         opensearch_build = version_tokens[0] + '.0'
-        plugin_no_snapshot = opensearch_build
+        artifact_version_tokens = artifactVersion.tokenize('-')
+        artifact_build = artifact_version_tokens[0]
+        if (artifact_build.tokenize('.').size() == 3) {
+            artifact_build += ".${artifactRevision}"
+        }
+        plugin_no_snapshot = artifact_build
         if (buildVersionQualifier) {
             opensearch_build += "-${buildVersionQualifier}"
             plugin_no_snapshot += "-${buildVersionQualifier}"
         }
         if (isSnapshot) {
-            opensearch_build += "-SNAPSHOT"
+            plugin_no_snapshot += "-SNAPSHOT"
         }
         opensearch_no_snapshot = opensearch_version.replace("-SNAPSHOT","")
-        common_utils_version = System.getProperty("common_utils.version", opensearch_build)
+        common_utils_version = System.getProperty("common_utils.version", "${wazuh_version}.${revision}")
         kotlin_version = '2.2.0'
     }
 
@@ -113,8 +125,8 @@ task ktlintFormat(type: JavaExec, group: "formatting") {
 check.dependsOn ktlint
 
 allprojects {
-    group = "org.opensearch"
-    version = "${opensearch_build}"
+    group = "com.wazuh"
+    version = "${plugin_no_snapshot}"
 
     apply from: "$rootDir/build-tools/repositories.gradle"
 

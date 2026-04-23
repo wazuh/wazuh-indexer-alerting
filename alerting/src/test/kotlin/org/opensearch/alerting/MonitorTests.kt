@@ -30,6 +30,7 @@ class MonitorTests : OpenSearchTestCase() {
         }
     }
 
+    @AwaitsFix(bugUrl = "Monitor limit not enforced since https://github.com/opensearch-project/alerting/pull/2036)")
     fun `test max triggers`() {
         val monitor = randomQueryLevelMonitor()
 

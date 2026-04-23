@@ -19,10 +19,11 @@ apply plugin: 'opensearch.repositories'
 dependencies {
     compileOnly "org.opensearch:opensearch:${opensearch_version}"
     compileOnly "org.jetbrains.kotlin:kotlin-stdlib:${kotlin_version}"
-    compileOnly "org.opensearch:common-utils:${common_utils_version}@jar"
+    compileOnly "com.wazuh:wazuh-indexer-common-utils:${common_utils_version}@jar"
 }
 
 shadowJar {
+    archiveBaseName = 'wazuh-indexer-alerting-spi'
     archiveClassifier = null
 }
 
@@ -55,8 +56,8 @@ publishing {
     publications {
         shadow(MavenPublication) {
             from components.shadow
-            groupId = 'org.opensearch.alerting'
-            artifactId = 'alerting-spi'
+            groupId = 'com.wazuh'
+            artifactId = 'wazuh-indexer-alerting-spi'
 
             artifact sourcesJar
             artifact javadocJar
