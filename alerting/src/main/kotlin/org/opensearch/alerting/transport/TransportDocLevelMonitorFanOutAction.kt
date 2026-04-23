@@ -109,6 +109,7 @@ import org.opensearch.core.xcontent.XContentBuilder
 import org.opensearch.index.query.BoolQueryBuilder
 import org.opensearch.index.query.Operator
 import org.opensearch.index.query.QueryBuilders
+import org.opensearch.index.query.QueryShardException
 import org.opensearch.index.seqno.SequenceNumbers
 import org.opensearch.indices.IndexClosedException
 import org.opensearch.monitor.jvm.JvmStats
@@ -878,12 +879,15 @@ class TransportDocLevelMonitorFanOutAction
                     updateLastRunContext(shard, currentSeqNo)
                 }
             } catch (e: Exception) {
-                log.error(
-                    "Monitor ${monitor.id} :" +
-                        "Failed to run fetch data from shard [$shard] of index [${indexExecutionCtx.concreteIndexName}]. " +
-                        "Error: ${e.message}",
-                    e
-                )
+                val msg = "Monitor ${monitor.id} :" +
+                    "Failed to run fetch data from shard [$shard] of index [${indexExecutionCtx.concreteIndexName}]. " +
+                    "Error: ${e.message}"
+                if (e is QueryShardException && e.message?.contains("No field mapping can be found") == true) {
+                    // Expected during WCS dynamic mapping bootstrap; resolves itself as data arrives.
+                    log.debug(msg, e)
+                } else {
+                    log.error(msg, e)
+                }
                 if (e is IndexClosedException) {
                     throw e
                 }
