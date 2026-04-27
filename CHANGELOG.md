@@ -17,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
--
+- Reduce alerting plugin log verbosity [(#25)](https://github.com/wazuh/wazuh-indexer-alerting/pull/25)
 
 ### Deprecated
 

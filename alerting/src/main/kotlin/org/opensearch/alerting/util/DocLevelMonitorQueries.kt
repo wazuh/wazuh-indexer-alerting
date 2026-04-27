@@ -460,7 +460,13 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             }
             bulkResponse.forEach { bulkItemResponse ->
                 if (bulkItemResponse.isFailed) {
-                    log.error(bulkItemResponse.failureMessage)
+                    val failureMessage = bulkItemResponse.failureMessage
+                    if (failureMessage?.contains("No field mapping can be found") == true) {
+                        // Expected during WCS dynamic mapping bootstrap; resolves itself as data arrives.
+                        log.debug(failureMessage)
+                    } else {
+                        log.error(failureMessage)
+                    }
                 }
             }
         }

@@ -514,10 +514,7 @@ class TransportIndexMonitorAction @Inject constructor(
                 .timeout(indexTimeout)
 
             log.info(
-                "Creating new monitor: ${request.monitor.toXContentWithUser(
-                    jsonBuilder(),
-                    ToXContent.MapParams(mapOf("with_type" to "true"))
-                )}"
+                "Creating new monitor: name=${request.monitor.name}, type=${request.monitor.monitorType}"
             )
 
             try {
@@ -687,10 +684,8 @@ class TransportIndexMonitorAction @Inject constructor(
                 .timeout(indexTimeout)
 
             log.info(
-                "Updating monitor, ${currentMonitor.id}, from: ${currentMonitor.toXContentWithUser(
-                    jsonBuilder(),
-                    ToXContent.MapParams(mapOf("with_type" to "true"))
-                )} \n to: ${request.monitor.toXContentWithUser(jsonBuilder(), ToXContent.MapParams(mapOf("with_type" to "true")))}"
+                "Updating monitor: id=${currentMonitor.id}, name=${request.monitor.name}, " +
+                    "type=${request.monitor.monitorType}"
             )
 
             try {
