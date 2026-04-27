@@ -879,14 +879,14 @@ class TransportDocLevelMonitorFanOutAction
                     updateLastRunContext(shard, currentSeqNo)
                 }
             } catch (e: Exception) {
-                val msg = "Monitor ${monitor.id} :" +
+                val message = "Monitor ${monitor.id} :" +
                     "Failed to run fetch data from shard [$shard] of index [${indexExecutionCtx.concreteIndexName}]. " +
                     "Error: ${e.message}"
                 if (e is QueryShardException && e.message?.contains("No field mapping can be found") == true) {
                     // Expected during WCS dynamic mapping bootstrap; resolves itself as data arrives.
-                    log.debug(msg, e)
+                    log.debug(message, e)
                 } else {
-                    log.error(msg, e)
+                    log.error(message, e)
                 }
                 if (e is IndexClosedException) {
                     throw e
