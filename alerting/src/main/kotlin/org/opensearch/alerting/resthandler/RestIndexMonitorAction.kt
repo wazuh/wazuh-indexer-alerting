@@ -202,6 +202,12 @@ class RestIndexMonitorAction : BaseRestHandler() {
                 }
             }
         }
+
+        // Reject shouldCreateSingleAlertForFindings=true: that path skips per-doc findings creation,
+        // which is the only mechanism AR monitors use to emit docs into wazuh-active-responses-*.
+        require(monitor.shouldCreateSingleAlertForFindings != true) {
+            "Active response monitor does not support shouldCreateSingleAlertForFindings=true."
+        }
     }
 
     private fun validateDataSources(monitor: Monitor) { // Data Sources will currently be supported only at transport layer.

@@ -123,6 +123,9 @@ class AlertIndices(
         /** The alias of the index in which to write alert finding */
         const val FINDING_HISTORY_WRITE_INDEX = ".opensearch-alerting-finding-history-write"
 
+        /** External alias (owned by another Wazuh plugin) where Active Response monitor docs are written. */
+        const val WAZUH_ACTIVE_RESPONSES_WRITE_ALIAS = "wazuh-active-responses"
+
         /** The index name pattern referring to all alert history indices */
         const val ALERT_HISTORY_ALL = ".opendistro-alerting-alert-history*"
 

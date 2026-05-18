@@ -31,6 +31,7 @@ import org.opensearch.alerting.TriggerService
 import org.opensearch.alerting.action.GetDestinationsAction
 import org.opensearch.alerting.action.GetDestinationsRequest
 import org.opensearch.alerting.action.GetDestinationsResponse
+import org.opensearch.alerting.alerts.AlertIndices
 import org.opensearch.alerting.model.AlertContext
 import org.opensearch.alerting.model.destination.Destination
 import org.opensearch.alerting.model.destination.DestinationContextFactory
@@ -60,6 +61,7 @@ import org.opensearch.alerting.util.destinationmigration.publishLegacyNotificati
 import org.opensearch.alerting.util.destinationmigration.sendNotification
 import org.opensearch.alerting.util.getActionExecutionPolicy
 import org.opensearch.alerting.util.getCancelAfterTimeInterval
+import org.opensearch.alerting.util.isActiveResponseMonitor
 import org.opensearch.alerting.util.isAllowed
 import org.opensearch.alerting.util.isTestAction
 import org.opensearch.alerting.util.parseSampleDocTags
@@ -397,6 +399,11 @@ class TransportDocLevelMonitorFanOutAction
         workflowRunContext: WorkflowRunContext?
     ): DocumentLevelTriggerRunResult {
         val triggerResult = triggerService.runDocLevelTrigger(monitor, trigger, queryToDocIds)
+        // Active response monitors must never go through the single-grouped-alert path — it skips findings entirely.
+        // Validation at create time rejects shouldCreateSingleAlertForFindings=true, but guard defensively.
+        if (monitor.isActiveResponseMonitor()) {
+            return DocumentLevelTriggerRunResult(trigger.name, listOf(), monitorResult.error)
+        }
         if (triggerResult.triggeredDocs.isNotEmpty()) {
             val findingIds = if (workflowRunContext?.findingIds != null) {
                 workflowRunContext.findingIds
@@ -452,6 +459,13 @@ class TransportDocLevelMonitorFanOutAction
         val triggerResult = triggerService.runDocLevelTrigger(monitor, trigger, queryToDocIds)
 
         val triggerFindingDocPairs = mutableListOf<Pair<String, String>>()
+
+        // Active response monitors emit a Wazuh-shaped doc to the wazuh-active-responses alias for each
+        // triggered source doc, then continue through the standard alert composition/save path so the
+        // firing surfaces via GET /_plugins/_alerting/monitors/alerts.
+        if (monitor.isActiveResponseMonitor() && !dryrun && monitor.id != Monitor.NO_ID) {
+            createActiveResponses(monitor, trigger, triggerResult.triggeredDocs)
+        }
 
         // TODO: Implement throttling for findings
         val findingToDocPairs = createFindings(
@@ -599,10 +613,13 @@ class TransportDocLevelMonitorFanOutAction
                     .string()
             log.trace("Findings: $findingStr")
 
+            // AR monitors persist only the Wazuh-shaped doc to wazuh-active-responses; suppress the
+            // standard finding write while still letting Finding objects exist in memory so alert
+            // composition above has finding IDs to attach.
             if (shouldCreateFinding and (
                 monitor.shouldCreateSingleAlertForFindings == null ||
                     monitor.shouldCreateSingleAlertForFindings == false
-                )
+                ) && !monitor.isActiveResponseMonitor()
             ) {
                 indexRequests += IndexRequest(monitor.dataSources.findingsIndex)
                     .source(findingStr, XContentType.JSON)
@@ -615,7 +632,9 @@ class TransportDocLevelMonitorFanOutAction
             bulkIndexFindings(monitor, indexRequests)
         }
 
-        if (monitor.shouldCreateSingleAlertForFindings == null || monitor.shouldCreateSingleAlertForFindings == false) {
+        if (!monitor.isActiveResponseMonitor() &&
+            (monitor.shouldCreateSingleAlertForFindings == null || monitor.shouldCreateSingleAlertForFindings == false)
+        ) {
             findings.forEach { finding ->
                 // Per-iteration try/catch: a synchronous throw from publishFinding for one
                 // finding must not drop the remaining findings in this batch from the
@@ -632,6 +651,95 @@ class TransportDocLevelMonitorFanOutAction
         return findingDocPairs
     }
 
+    /**
+     * Emits one Wazuh-shaped document per triggered source doc into the wazuh-active-responses
+     * data stream. Schema is dictated by the active-responses.json template owned by the
+     * Wazuh setup plugin (strict mapping): @timestamp + event.{doc_id,index} + wazuh.* subtree.
+     */
+    private suspend fun createActiveResponses(
+        monitor: Monitor,
+        trigger: DocumentLevelTrigger,
+        triggeredDocs: Collection<String>,
+    ) {
+        if (triggeredDocs.isEmpty()) return
+
+        val sourceWazuhByKey = fetchSourceWazuhSubtrees(monitor, triggeredDocs)
+        val timestamp = Instant.now().toString()
+        val indexRequests = mutableListOf<IndexRequest>()
+
+        triggeredDocs.forEach { key ->
+            val parts = key.split("|")
+            if (parts.size != 2 || parts[0].isEmpty() || parts[1].isEmpty()) return@forEach
+            val docId = parts[0]
+            val sourceIndex = parts[1]
+
+            val doc: Map<String, Any> = mapOf(
+                "@timestamp" to timestamp,
+                "event" to mapOf("doc_id" to docId, "index" to sourceIndex),
+                "wazuh" to buildWazuhSubtree(trigger, sourceWazuhByKey[key])
+            )
+
+            val builder = XContentFactory.jsonBuilder().map(doc)
+            indexRequests += IndexRequest(AlertIndices.WAZUH_ACTIVE_RESPONSES_WRITE_ALIAS)
+                .source(BytesReference.bytes(builder), XContentType.JSON)
+                .opType(DocWriteRequest.OpType.CREATE)
+        }
+
+        if (indexRequests.isNotEmpty()) {
+            bulkIndexFindings(monitor, indexRequests)
+        }
+    }
+
+    private fun buildWazuhSubtree(trigger: DocumentLevelTrigger, sourceWazuh: Map<String, Any>?): Map<String, Any> {
+        // Top-level keys under "wazuh" that the active-responses template declares. Anything else
+        // present on the source finding (e.g. "rule") is stripped to avoid strict-mapping rejection.
+        val allowed = setOf("agent", "cluster", "event", "integration", "protocol", "schema", "space", "threat")
+        val out = mutableMapOf<String, Any>()
+        sourceWazuh?.forEach { (k, v) ->
+            if (k in allowed && v != null) out[k] = v
+        }
+        out["active_response"] = mapOf("name" to trigger.name)
+        return out
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private suspend fun fetchSourceWazuhSubtrees(
+        monitor: Monitor,
+        triggeredDocs: Collection<String>,
+    ): Map<String, Map<String, Any>> {
+        val result = mutableMapOf<String, Map<String, Any>>()
+        triggeredDocs.chunked(findingsIndexBatchSize).forEach { batch ->
+            val request = MultiGetRequest()
+            val keyByDocIdIndex = mutableMapOf<Pair<String, String>, String>()
+            batch.forEach { key ->
+                val parts = key.split("|")
+                if (parts.size != 2 || parts[0].isEmpty() || parts[1].isEmpty()) return@forEach
+                val docId = parts[0]
+                val sourceIndex = parts[1]
+                keyByDocIdIndex[docId to sourceIndex] = key
+                request.add(
+                    MultiGetRequest.Item(sourceIndex, docId)
+                        .fetchSourceContext(FetchSourceContext(true, arrayOf("wazuh"), emptyArray()))
+                )
+            }
+            if (request.items.isEmpty()) return@forEach
+            val response = client.suspendUntil { client.multiGet(request, it) }
+            response.responses.forEach { item ->
+                if (item.isFailed) {
+                    log.warn(
+                        "AR source doc mget failed for monitor [${monitor.id}] doc ${item.id}: ${item.failure?.message}"
+                    )
+                    return@forEach
+                }
+                val src = item.response?.sourceAsMap ?: return@forEach
+                val wazuh = src["wazuh"] as? Map<String, Any> ?: return@forEach
+                val key = keyByDocIdIndex[item.id to item.index] ?: return@forEach
+                result[key] = wazuh
+            }
+        }
+        return result
+    }
+
     private suspend fun bulkIndexFindings(
         monitor: Monitor,
         indexRequests: List<IndexRequest>
@@ -643,14 +751,19 @@ class TransportDocLevelMonitorFanOutAction
             if (bulkResponse.hasFailures()) {
                 bulkResponse.items.forEach { item ->
                     if (item.isFailed) {
-                        log.error("Failed indexing the finding ${item.id} of monitor [${monitor.id}]")
+                        log.error(
+                            "Failed indexing the finding ${item.id} of monitor [${monitor.id}] " +
+                                "into [${item.index}] (status=${item.status()}): ${item.failureMessage}"
+                        )
                     }
                 }
             } else {
                 log.debug("[${bulkResponse.items.size}] All findings successfully indexed.")
             }
         }
-        client.execute(RefreshAction.INSTANCE, RefreshRequest(monitor.dataSources.findingsIndex))
+        if (!monitor.isActiveResponseMonitor()) {
+            client.execute(RefreshAction.INSTANCE, RefreshRequest(monitor.dataSources.findingsIndex))
+        }
     }
 
     private fun publishFinding(

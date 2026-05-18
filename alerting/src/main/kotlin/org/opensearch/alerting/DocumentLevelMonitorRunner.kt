@@ -11,6 +11,7 @@ import org.opensearch.Version
 import org.opensearch.action.ActionListenerResponseHandler
 import org.opensearch.action.support.GroupedActionListener
 import org.opensearch.alerting.util.IndexUtils
+import org.opensearch.alerting.util.isActiveResponseMonitor
 import org.opensearch.cluster.metadata.IndexMetadata
 import org.opensearch.cluster.node.DiscoveryNode
 import org.opensearch.cluster.routing.ShardRouting
@@ -71,7 +72,9 @@ class DocumentLevelMonitorRunner : MonitorRunner() {
         try {
             monitorCtx.alertIndices!!.createOrUpdateAlertIndex(monitor.dataSources)
             monitorCtx.alertIndices!!.createOrUpdateInitialAlertHistoryIndex(monitor.dataSources)
-            monitorCtx.alertIndices!!.createOrUpdateInitialFindingHistoryIndex(monitor.dataSources)
+            if (!monitor.isActiveResponseMonitor()) {
+                monitorCtx.alertIndices!!.createOrUpdateInitialFindingHistoryIndex(monitor.dataSources)
+            }
         } catch (e: Exception) {
             val id = if (monitor.id.trim().isEmpty()) "_na_" else monitor.id
             val unwrappedException = ExceptionsHelper.unwrapCause(e)
