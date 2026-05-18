@@ -30,6 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 - Fix publish-findings forEach try/catch dropping rest of batch on first error [(#49)](https://github.com/wazuh/wazuh-indexer-alerting/pull/49)
+- Write active responses to wazuh-active-responses data stream [(#63)](https://github.com/wazuh/wazuh-indexer-alerting/pull/63)
 
   
 
