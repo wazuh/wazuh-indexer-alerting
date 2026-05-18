@@ -63,7 +63,12 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         const val NESTED = "nested"
         const val TYPE = "type"
         const val INDEX_PATTERN_SUFFIX = "-000001"
+        private val RESERVED_QUERY_INDEX_FIELDS = setOf("query", "monitor_id", "index")
         const val QUERY_INDEX_BASE_FIELDS_COUNT = 8 // 3 fields we defined and 5 builtin additional metadata fields
+
+        @JvmStatic
+        fun isReservedQueryIndexField(fieldName: String): Boolean = RESERVED_QUERY_INDEX_FIELDS.contains(fieldName)
+
         @JvmStatic
         fun docLevelQueriesMappings(): String {
             return DocLevelMonitorQueries::class.java.classLoader.getResource("mappings/doc-level-queries.json").readText()
@@ -334,6 +339,10 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                         flattenPaths.keys.forEach { allFlattenPaths.add(Pair(it, concreteIndexName)) }
                         // Updated mappings ready to be applied on queryIndex
                         properties.forEach {
+                            if (isReservedQueryIndexField(it.key)) {
+                                log.debug("Skipping reserved query index field [{}] from source index mappings", it.key)
+                                return@forEach
+                            }
                             if (
                                 it.value is Map<*, *> &&
                                 (it.value as Map<String, Any>).containsKey("type") &&

@@ -256,4 +256,11 @@ class AlertingUtilsTests : OpenSearchTestCase() {
         assertTrue("Expected 'message' in flatten paths", flattenPaths.containsKey("message"))
         assertTrue("Expected 'dll.name' in flatten paths", flattenPaths.containsKey("dll.name"))
     }
+
+    fun `test isReservedQueryIndexField identifies reserved names`() {
+        assertTrue(DocLevelMonitorQueries.isReservedQueryIndexField("query"))
+        assertTrue(DocLevelMonitorQueries.isReservedQueryIndexField("monitor_id"))
+        assertTrue(DocLevelMonitorQueries.isReservedQueryIndexField("index"))
+        assertFalse(DocLevelMonitorQueries.isReservedQueryIndexField("message"))
+    }
 }
