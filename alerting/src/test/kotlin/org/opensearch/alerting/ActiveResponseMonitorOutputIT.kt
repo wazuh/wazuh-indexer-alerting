@@ -23,31 +23,51 @@ class ActiveResponseMonitorOutputIT : AlertingRestTestCase() {
 
     private val arWriteAlias = AlertIndices.WAZUH_ACTIVE_RESPONSES_WRITE_ALIAS
 
-    fun `test active response monitor writes to wazuh-active-responses and skips findings and alerts`() {
+    fun `test active response monitor emits wazuh-shaped doc to wazuh-active-responses`() {
         val sourceIndex = "wazuh-findings-v5-test-${randomAlphaOfLength(6).lowercase()}"
+        // Source-doc mapping covers the fields the AR write reads (wazuh.agent.*) and the doc-level query (rule.level).
         createTestIndex(
             sourceIndex,
             """
             "properties" : {
-              "rule" : {
+              "rule" : { "properties" : { "level" : { "type" : "integer" } } },
+              "wazuh" : {
                 "properties" : {
-                  "level" : { "type" : "integer" }
+                  "agent" : {
+                    "properties" : {
+                      "id" : { "type" : "keyword" },
+                      "name" : { "type" : "keyword" }
+                    }
+                  },
+                  "cluster" : {
+                    "properties" : { "name" : { "type" : "keyword" } }
+                  }
                 }
               }
             }
             """.trimIndent()
         )
 
-        // Pre-create the AR destination index. In production this alias is owned by another
-        // Wazuh plugin; here we seed it explicitly so the write isn't relying on auto-create.
+        // Pre-create the destination index. In production, this alias maps to a data stream owned by
+        // another Wazuh plugin; the test substitutes a plain index because the data stream template
+        // is not installed in the alerting integTest cluster.
         adminClient().makeRequest("PUT", "/$arWriteAlias")
 
-        val testDoc = """{ "rule" : { "level" : 10 } }"""
-        indexDoc(sourceIndex, "1", testDoc)
+        val testDoc = """
+            {
+              "rule" : { "level" : 10 },
+              "wazuh" : {
+                "agent" : { "id" : "001", "name" : "agent-alpha" },
+                "cluster" : { "name" : "wazuh-cluster" }
+              }
+            }
+        """.trimIndent()
+        indexDoc(sourceIndex, "src-1", testDoc)
 
         val docQuery = DocLevelQuery(query = "rule.level:>=10", name = "high_severity", fields = listOf())
         val docLevelInput = DocLevelMonitorInput("description", listOf(sourceIndex), listOf(docQuery))
-        val trigger = randomDocumentLevelTrigger(condition = ALWAYS_RUN)
+        val triggerName = "block-agent"
+        val trigger = randomDocumentLevelTrigger(name = triggerName, condition = ALWAYS_RUN)
 
         val arMonitor = Monitor(
             name = "ar-output-it-${randomAlphaOfLength(5)}",
@@ -67,17 +87,28 @@ class ActiveResponseMonitorOutputIT : AlertingRestTestCase() {
 
         executeMonitor(monitor.id)
 
-        // AR path skips the synchronous refresh in bulkIndexFindings, so refresh explicitly before asserting.
+        // AR path skips the synchronous refresh in bulkIndexFindings — refresh explicitly to read back.
         refreshIndex(arWriteAlias)
-        val arHits = searchHitsByMonitorId(arWriteAlias, monitor.id)
-        assertEquals("AR doc was not written to $arWriteAlias", 1, arHits)
+        val arHits = searchHits(arWriteAlias, """{ "query" : { "match_all" : {} } }""")
+        assertEquals("Expected exactly one AR doc in $arWriteAlias", 1, arHits.size)
 
-        // Findings history index must be empty for this monitor.
-        val findingsHits = searchHitsByMonitorId(AlertIndices.ALL_FINDING_INDEX_PATTERN, monitor.id)
+        @Suppress("UNCHECKED_CAST")
+        val doc = arHits.first()
+        assertNotNull("Missing @timestamp", doc["@timestamp"])
+        val event = doc["event"] as Map<String, Any>
+        assertEquals("src-1", event["doc_id"])
+        assertEquals(sourceIndex, event["index"])
+        val wazuh = doc["wazuh"] as Map<String, Any>
+        val activeResponse = wazuh["active_response"] as Map<String, Any>
+        assertEquals(triggerName, activeResponse["name"])
+        val agent = wazuh["agent"] as Map<String, Any>
+        assertEquals("001", agent["id"])
+        assertEquals("agent-alpha", agent["name"])
+
+        // Standard findings/alerts indices must remain untouched for this monitor.
+        val findingsHits = countHitsByMonitorId(AlertIndices.ALL_FINDING_INDEX_PATTERN, monitor.id)
         assertEquals("AR monitor must not write to the findings history index", 0, findingsHits)
-
-        // Alert index must contain no doc-level alerts for this monitor.
-        val alertHits = searchHitsByMonitorId(AlertIndices.ALERT_INDEX, monitor.id)
+        val alertHits = countHitsByMonitorId(AlertIndices.ALERT_INDEX, monitor.id)
         assertEquals("AR monitor must not produce alerts", 0, alertHits)
     }
 
@@ -115,7 +146,19 @@ class ActiveResponseMonitorOutputIT : AlertingRestTestCase() {
         }
     }
 
-    private fun searchHitsByMonitorId(index: String, monitorId: String): Int {
+    @Suppress("UNCHECKED_CAST")
+    private fun searchHits(index: String, body: String): List<Map<String, Any>> {
+        val response = adminClient().makeRequest(
+            "GET", "/$index/_search?ignore_unavailable=true",
+            StringEntity(body, ContentType.APPLICATION_JSON)
+        )
+        assertEquals("Search failed on $index", RestStatus.OK, response.restStatus())
+        val parser = createParser(JsonXContent.jsonXContent, response.entity.content)
+        val searchResponse = SearchResponse.fromXContent(parser)
+        return searchResponse.hits.hits.map { it.sourceAsMap as Map<String, Any> }
+    }
+
+    private fun countHitsByMonitorId(index: String, monitorId: String): Int {
         val body = """
             { "query" : { "term" : { "monitor_id" : "$monitorId" } } }
         """.trimIndent()
@@ -125,7 +168,6 @@ class ActiveResponseMonitorOutputIT : AlertingRestTestCase() {
         )
         assertEquals("Search failed on $index", RestStatus.OK, response.restStatus())
         val parser = createParser(JsonXContent.jsonXContent, response.entity.content)
-        val searchResponse = SearchResponse.fromXContent(parser)
-        return searchResponse.hits.hits.size
+        return SearchResponse.fromXContent(parser).hits.hits.size
     }
 }

@@ -8,7 +8,6 @@ package org.opensearch.alerting.util
 import org.apache.logging.log4j.LogManager
 import org.opensearch.alerting.AlertService
 import org.opensearch.alerting.MonitorRunnerService
-import org.opensearch.alerting.alerts.AlertIndices
 import org.opensearch.alerting.model.AlertContext
 import org.opensearch.alerting.model.destination.Destination
 import org.opensearch.alerting.script.BucketLevelTriggerExecutionContext
@@ -92,10 +91,6 @@ fun Monitor.isQueryLevelMonitor(): Boolean =
 fun Monitor.isActiveResponseMonitor(): Boolean =
     this.isMonitorOfStandardType() &&
         Monitor.MonitorType.valueOf(this.monitorType.uppercase(Locale.ROOT)) == Monitor.MonitorType.ACTIVE_RESPONSE_MONITOR
-
-fun Monitor.targetFindingsIndex(): String =
-    if (this.isActiveResponseMonitor()) AlertIndices.WAZUH_ACTIVE_RESPONSES_WRITE_ALIAS
-    else this.dataSources.findingsIndex
 
 /**
  * Since buckets can have multi-value keys, this converts the bucket key values to a string that can be used
