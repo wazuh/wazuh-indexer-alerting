@@ -105,11 +105,13 @@ class ActiveResponseMonitorOutputIT : AlertingRestTestCase() {
         assertEquals("001", agent["id"])
         assertEquals("agent-alpha", agent["name"])
 
-        // Standard findings/alerts indices must remain untouched for this monitor.
+        // Findings history must remain empty — AR persists only the Wazuh doc, not Findings.
         val findingsHits = countHitsByMonitorId(AlertIndices.ALL_FINDING_INDEX_PATTERN, monitor.id)
         assertEquals("AR monitor must not write to the findings history index", 0, findingsHits)
+
+        // Alerts ARE created so AR firings surface via GET /_plugins/_alerting/monitors/alerts.
         val alertHits = countHitsByMonitorId(AlertIndices.ALERT_INDEX, monitor.id)
-        assertEquals("AR monitor must not produce alerts", 0, alertHits)
+        assertEquals("AR monitor should produce one alert per triggered doc", 1, alertHits)
     }
 
     fun `test active response monitor rejects shouldCreateSingleAlertForFindings`() {

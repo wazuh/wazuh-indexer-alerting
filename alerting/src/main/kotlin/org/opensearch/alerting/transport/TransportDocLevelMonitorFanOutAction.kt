@@ -460,13 +460,11 @@ class TransportDocLevelMonitorFanOutAction
 
         val triggerFindingDocPairs = mutableListOf<Pair<String, String>>()
 
-        // Active response monitors emit Wazuh-shaped docs (per active-responses.json template) for
-        // triggered source docs. They produce no findings, no alerts, and no trigger actions.
-        if (monitor.isActiveResponseMonitor()) {
-            if (!dryrun && monitor.id != Monitor.NO_ID) {
-                createActiveResponses(monitor, trigger, triggerResult.triggeredDocs)
-            }
-            return triggerResult
+        // Active response monitors emit a Wazuh-shaped doc to the wazuh-active-responses alias for each
+        // triggered source doc, then continue through the standard alert composition/save path so the
+        // firing surfaces via GET /_plugins/_alerting/monitors/alerts.
+        if (monitor.isActiveResponseMonitor() && !dryrun && monitor.id != Monitor.NO_ID) {
+            createActiveResponses(monitor, trigger, triggerResult.triggeredDocs)
         }
 
         // TODO: Implement throttling for findings
@@ -615,10 +613,13 @@ class TransportDocLevelMonitorFanOutAction
                     .string()
             log.trace("Findings: $findingStr")
 
+            // AR monitors persist only the Wazuh-shaped doc to wazuh-active-responses; suppress the
+            // standard finding write while still letting Finding objects exist in memory so alert
+            // composition above has finding IDs to attach.
             if (shouldCreateFinding and (
                 monitor.shouldCreateSingleAlertForFindings == null ||
                     monitor.shouldCreateSingleAlertForFindings == false
-                )
+                ) && !monitor.isActiveResponseMonitor()
             ) {
                 indexRequests += IndexRequest(monitor.dataSources.findingsIndex)
                     .source(findingStr, XContentType.JSON)
