@@ -658,7 +658,10 @@ class TransportDocLevelMonitorFanOutAction
             if (bulkResponse.hasFailures()) {
                 bulkResponse.items.forEach { item ->
                     if (item.isFailed) {
-                        log.error("Failed indexing the finding ${item.id} of monitor [${monitor.id}]")
+                        log.error(
+                            "Failed indexing the finding ${item.id} of monitor [${monitor.id}] " +
+                                "into [${item.index}] (status=${item.status()}): ${item.failureMessage}"
+                        )
                     }
                 }
             } else {
