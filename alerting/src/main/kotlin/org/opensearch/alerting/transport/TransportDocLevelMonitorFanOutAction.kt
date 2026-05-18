@@ -60,10 +60,12 @@ import org.opensearch.alerting.util.destinationmigration.publishLegacyNotificati
 import org.opensearch.alerting.util.destinationmigration.sendNotification
 import org.opensearch.alerting.util.getActionExecutionPolicy
 import org.opensearch.alerting.util.getCancelAfterTimeInterval
+import org.opensearch.alerting.util.isActiveResponseMonitor
 import org.opensearch.alerting.util.isAllowed
 import org.opensearch.alerting.util.isTestAction
 import org.opensearch.alerting.util.parseSampleDocTags
 import org.opensearch.alerting.util.printsSampleDocData
+import org.opensearch.alerting.util.targetFindingsIndex
 import org.opensearch.alerting.util.use
 import org.opensearch.cluster.routing.Preference
 import org.opensearch.cluster.service.ClusterService
@@ -397,6 +399,11 @@ class TransportDocLevelMonitorFanOutAction
         workflowRunContext: WorkflowRunContext?
     ): DocumentLevelTriggerRunResult {
         val triggerResult = triggerService.runDocLevelTrigger(monitor, trigger, queryToDocIds)
+        // Active response monitors must never go through the single-grouped-alert path — it skips findings entirely.
+        // Validation at create time rejects shouldCreateSingleAlertForFindings=true, but guard defensively.
+        if (monitor.isActiveResponseMonitor()) {
+            return DocumentLevelTriggerRunResult(trigger.name, listOf(), monitorResult.error)
+        }
         if (triggerResult.triggeredDocs.isNotEmpty()) {
             val findingIds = if (workflowRunContext?.findingIds != null) {
                 workflowRunContext.findingIds
@@ -461,6 +468,12 @@ class TransportDocLevelMonitorFanOutAction
             !dryrun && monitor.id != Monitor.NO_ID,
             executionId
         )
+
+        // Active response monitors persist their output to wazuh-active-responses-* via createFindings().
+        // They produce no alerts and no trigger actions; downstream consumers read the alias directly.
+        if (monitor.isActiveResponseMonitor()) {
+            return triggerResult
+        }
 
         findingToDocPairs.forEach {
             // Only pick those entries whose docs have triggers associated with them
@@ -604,7 +617,7 @@ class TransportDocLevelMonitorFanOutAction
                     monitor.shouldCreateSingleAlertForFindings == false
                 )
             ) {
-                indexRequests += IndexRequest(monitor.dataSources.findingsIndex)
+                indexRequests += IndexRequest(monitor.targetFindingsIndex())
                     .source(findingStr, XContentType.JSON)
                     .id(finding.id)
                     .opType(DocWriteRequest.OpType.CREATE)
@@ -615,7 +628,9 @@ class TransportDocLevelMonitorFanOutAction
             bulkIndexFindings(monitor, indexRequests)
         }
 
-        if (monitor.shouldCreateSingleAlertForFindings == null || monitor.shouldCreateSingleAlertForFindings == false) {
+        if (!monitor.isActiveResponseMonitor() &&
+            (monitor.shouldCreateSingleAlertForFindings == null || monitor.shouldCreateSingleAlertForFindings == false)
+        ) {
             findings.forEach { finding ->
                 // Per-iteration try/catch: a synchronous throw from publishFinding for one
                 // finding must not drop the remaining findings in this batch from the
@@ -650,7 +665,9 @@ class TransportDocLevelMonitorFanOutAction
                 log.debug("[${bulkResponse.items.size}] All findings successfully indexed.")
             }
         }
-        client.execute(RefreshAction.INSTANCE, RefreshRequest(monitor.dataSources.findingsIndex))
+        if (!monitor.isActiveResponseMonitor()) {
+            client.execute(RefreshAction.INSTANCE, RefreshRequest(monitor.targetFindingsIndex()))
+        }
     }
 
     private fun publishFinding(
