@@ -100,6 +100,7 @@ import org.opensearch.commons.alerting.model.action.PerAlertActionScope
 import org.opensearch.commons.alerting.model.userErrorMessage
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.commons.alerting.util.string
+import org.opensearch.commons.notifications.model.ActiveResponse
 import org.opensearch.commons.notifications.model.NotificationConfigInfo
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.common.Strings
@@ -663,6 +664,7 @@ class TransportDocLevelMonitorFanOutAction
     ) {
         if (triggeredDocs.isEmpty()) return
 
+        val activeResponseConfig = fetchActiveResponseConfig(monitor, trigger)
         val sourceWazuhByKey = fetchSourceWazuhSubtrees(monitor, triggeredDocs)
         val timestamp = Instant.now().toString()
         val indexRequests = mutableListOf<IndexRequest>()
@@ -676,7 +678,7 @@ class TransportDocLevelMonitorFanOutAction
             val doc: Map<String, Any> = mapOf(
                 "@timestamp" to timestamp,
                 "event" to mapOf("doc_id" to docId, "index" to sourceIndex),
-                "wazuh" to buildWazuhSubtree(trigger, sourceWazuhByKey[key])
+                "wazuh" to buildWazuhSubtree(trigger, activeResponseConfig, sourceWazuhByKey[key])
             )
 
             val builder = XContentFactory.jsonBuilder().map(doc)
@@ -690,7 +692,55 @@ class TransportDocLevelMonitorFanOutAction
         }
     }
 
-    private fun buildWazuhSubtree(trigger: DocumentLevelTrigger, sourceWazuh: Map<String, Any>?): Map<String, Any> {
+    /**
+     * Fetches the [ActiveResponse] channel configuration from the notification channel
+     * referenced by the trigger's first action. Reads directly from the notifications
+     * system index to avoid permission issues with the notifications plugin API.
+     * Returns null if no action is configured, the config is not found, or it is not
+     * an active_response type.
+     */
+    private suspend fun fetchActiveResponseConfig(monitor: Monitor, trigger: DocumentLevelTrigger): ActiveResponse? {
+        val destinationId = trigger.actions.firstOrNull()?.destinationId
+        if (destinationId.isNullOrEmpty()) {
+            log.warn("AR trigger [${trigger.name}] has no actions with a destination; active_response fields will be incomplete")
+            return null
+        }
+        return try {
+            val getRequest = org.opensearch.action.get.GetRequest(".opensearch-notifications-config", destinationId)
+            val response: org.opensearch.action.get.GetResponse = client.threadPool().threadContext.stashContext().use {
+                client.suspendUntil { client.get(getRequest, it) }
+            }
+            if (!response.isExists) {
+                log.warn("Notification config [$destinationId] not found in notifications index")
+                return null
+            }
+            val source = response.sourceAsMap
+            val config = source["config"] as? Map<String, Any> ?: return null
+            val configType = config["config_type"] as? String
+            if (configType != "active_response") {
+                log.warn("Notification config [$destinationId] is type [$configType], not active_response")
+                return null
+            }
+            val arMap = config["active_response"] as? Map<String, Any> ?: return null
+            ActiveResponse(
+                type = arMap["type"] as? String ?: return null,
+                statefulTimeout = (arMap["stateful_timeout"] as? Number)?.toInt(),
+                executable = arMap["executable"] as? String ?: return null,
+                args = arMap["extra_args"] as? String,
+                location = arMap["location"] as? String ?: return null,
+                agentId = arMap["agent_id"] as? String
+            )
+        } catch (e: Exception) {
+            log.warn("Failed to fetch AR channel config for destination [$destinationId]: ${e.message}")
+            null
+        }
+    }
+
+    private fun buildWazuhSubtree(
+        trigger: DocumentLevelTrigger,
+        arConfig: ActiveResponse?,
+        sourceWazuh: Map<String, Any>?
+    ): Map<String, Any> {
         // Top-level keys under "wazuh" that the active-responses template declares. Anything else
         // present on the source finding (e.g. "rule") is stripped to avoid strict-mapping rejection.
         val allowed = setOf("agent", "cluster", "event", "integration", "protocol", "schema", "space", "threat")
@@ -698,7 +748,17 @@ class TransportDocLevelMonitorFanOutAction
         sourceWazuh?.forEach { (k, v) ->
             if (k in allowed && v != null) out[k] = v
         }
-        out["active_response"] = mapOf("name" to trigger.name)
+
+        val arFields = mutableMapOf<String, Any>("name" to trigger.name)
+        if (arConfig != null) {
+            arFields["executable"] = arConfig.executable
+            arFields["location"] = arConfig.location
+            arFields["type"] = arConfig.type
+            arConfig.agentId?.let { arFields["agent_id"] = it }
+            arConfig.statefulTimeout?.let { arFields["stateful_timeout"] = it }
+            arConfig.args?.let { arFields["extra_arguments"] = it }
+        }
+        out["active_response"] = arFields
         return out
     }
 
