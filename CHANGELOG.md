@@ -37,4 +37,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
   
 
-[Unreleased 5.0.x]: https://github.com/wazuh/wazuh-indexer-alerting/compare/Zero...HEAD
+[Unreleased 5.0.x]: https://github.com/wazuh/wazuh-indexer-alerting/compare/f4b9eb4fb9a698ff40648d4adac808c83d9d4cf7...main
