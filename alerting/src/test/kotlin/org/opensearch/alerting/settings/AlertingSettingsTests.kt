@@ -161,7 +161,6 @@ class AlertingSettingsTests : OpenSearchTestCase() {
 
         assertSettingDeprecationsAndWarnings(
             arrayOf(
-                LegacyOpenDistroAlertingSettings.ALERTING_MAX_MONITORS,
                 LegacyOpenDistroAlertingSettings.INPUT_TIMEOUT,
                 LegacyOpenDistroAlertingSettings.INDEX_TIMEOUT,
                 LegacyOpenDistroAlertingSettings.BULK_TIMEOUT,
