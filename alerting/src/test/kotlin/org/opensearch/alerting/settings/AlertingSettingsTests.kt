@@ -136,7 +136,7 @@ class AlertingSettingsTests : OpenSearchTestCase() {
             .put("opendistro.scheduled_jobs.sweeper.period", TimeValue.timeValueMinutes(5))
             .put("opendistro.scheduled_jobs.sweeper.page_size", 100).build()
 
-        assertEquals(AlertingSettings.ALERTING_MAX_MONITORS.get(settings), 1000)
+        assertEquals(AlertingSettings.ALERTING_MAX_MONITORS.get(settings), 10)
         assertEquals(AlertingSettings.INPUT_TIMEOUT.get(settings), TimeValue.timeValueSeconds(30))
         assertEquals(AlertingSettings.INDEX_TIMEOUT.get(settings), TimeValue.timeValueSeconds(60))
         assertEquals(AlertingSettings.BULK_TIMEOUT.get(settings), TimeValue.timeValueSeconds(120))
@@ -161,7 +161,6 @@ class AlertingSettingsTests : OpenSearchTestCase() {
 
         assertSettingDeprecationsAndWarnings(
             arrayOf(
-                LegacyOpenDistroAlertingSettings.ALERTING_MAX_MONITORS,
                 LegacyOpenDistroAlertingSettings.INPUT_TIMEOUT,
                 LegacyOpenDistroAlertingSettings.INDEX_TIMEOUT,
                 LegacyOpenDistroAlertingSettings.BULK_TIMEOUT,

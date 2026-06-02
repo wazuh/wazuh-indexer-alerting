@@ -105,7 +105,8 @@ public class SampleRemoteMonitorRestHandler extends BaseRestHandler {
                 WriteRequest.RefreshPolicy.IMMEDIATE,
                 RestRequest.Method.POST,
                 monitor1,
-                null
+                null,
+                false
         );
 
         if (runMonitorParam.equals("single")) {
@@ -167,7 +168,8 @@ public class SampleRemoteMonitorRestHandler extends BaseRestHandler {
                     WriteRequest.RefreshPolicy.IMMEDIATE,
                     RestRequest.Method.POST,
                     monitor2,
-                    null
+                    null,
+                    false
             );
 
             return restChannel -> {
@@ -252,7 +254,8 @@ public class SampleRemoteMonitorRestHandler extends BaseRestHandler {
                     WriteRequest.RefreshPolicy.IMMEDIATE,
                     RestRequest.Method.POST,
                     remoteDocLevelMonitor,
-                    null
+                    null,
+                    false
             );
             return restChannel -> {
                 client.doExecute(

@@ -188,6 +188,7 @@ class TransportIndexMonitorAction @Inject constructor(
         request: IndexMonitorRequest,
         user: User?,
     ) {
+        val isInternal = request.internalCaller
         val indices = mutableListOf<String>()
         // todo: for doc level alerting: check if index is present before monitor is created.
         val searchInputs = request.monitor.inputs.filter {
@@ -217,7 +218,7 @@ class TransportIndexMonitorAction @Inject constructor(
                 override fun onResponse(searchResponse: SearchResponse) {
                     // User has read access to configured indices in the monitor, now create monitor with out user context.
                     client.threadPool().threadContext.stashContext().use {
-                        IndexMonitorHandler(client, actionListener, request, user).resolveUserAndStart()
+                        IndexMonitorHandler(client, actionListener, request, user, isInternal).resolveUserAndStart()
                     }
                 }
 
@@ -254,8 +255,9 @@ class TransportIndexMonitorAction @Inject constructor(
         request: IndexMonitorRequest,
         user: User?,
     ) {
+        val isInternal = request.internalCaller
         client.threadPool().threadContext.stashContext().use {
-            IndexMonitorHandler(client, actionListener, request, user).resolveUserAndStartForAD()
+            IndexMonitorHandler(client, actionListener, request, user, isInternal).resolveUserAndStartForAD()
         }
     }
 
@@ -264,6 +266,7 @@ class TransportIndexMonitorAction @Inject constructor(
         private val actionListener: ActionListener<IndexMonitorResponse>,
         private val request: IndexMonitorRequest,
         private val user: User?,
+        private val internalCaller: Boolean = false,
     ) {
 
         fun resolveUserAndStart() {
@@ -391,8 +394,16 @@ class TransportIndexMonitorAction @Inject constructor(
                 scope.launch {
                     updateMonitor()
                 }
+            } else if (internalCaller) {
+                // Internal callers (e.g. Content Manager via SAP) bypass the max monitors limit
+                // so that standard detectors can always create their monitors.
+                scope.launch {
+                    indexMonitor()
+                }
             } else {
-                val query = QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("${Monitor.MONITOR_TYPE}.type", Monitor.MONITOR_TYPE))
+                val query = QueryBuilders.boolQuery()
+                    .filter(QueryBuilders.termQuery("${Monitor.MONITOR_TYPE}.type", Monitor.MONITOR_TYPE))
+                    .mustNot(QueryBuilders.termQuery("${Monitor.MONITOR_TYPE}.${Monitor.OWNER_FIELD}", "security_analytics"))
                 val searchSource = SearchSourceBuilder().query(query).timeout(requestTimeout)
                 val searchRequest = SearchRequest(SCHEDULED_JOBS_INDEX).source(searchSource)
 
