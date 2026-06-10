@@ -1,7 +1,8 @@
 name: (5.x) Check links
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "00 8 * * 5"
+  workflow_dispatch:
 
 jobs:
   linkchecker:
