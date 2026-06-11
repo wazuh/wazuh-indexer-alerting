@@ -11,7 +11,7 @@ apply plugin: 'jacoco'
 configurations{
     all {
         resolutionStrategy {
-            // force commons-beanutils to a non-vulnerable version
+            // force commons-beanutilsadsdas to a non-vulnerable version
             force "commons-beanutils:commons-beanutils:1.11.0"
         }
     }
@@ -20,7 +20,7 @@ configurations{
 
 dependencies {
     compileOnly "org.opensearch:opensearch:${opensearch_version}"
-    
+
     implementation "org.jetbrains.kotlin:kotlin-stdlib:${kotlin_version}"
     api 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.1.1'
     api "org.jetbrains.kotlin:kotlin-stdlib-jdk8:${kotlin_version}"
