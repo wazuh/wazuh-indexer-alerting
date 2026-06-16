@@ -39,6 +39,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Prior versions
 
-There are no prior versions. This is the initial release of Wazuh Indexer.
+This is the initial release of Wazuh Indexer 5.0, so there are no prior 5.x versions. Previous releases can be found under the 4.x branch.
 
 [Unreleased 5.0.x]: https://github.com/wazuh/wazuh-indexer-alerting/compare/f4b9eb4fb9a698ff40648d4adac808c83d9d4cf7...main
