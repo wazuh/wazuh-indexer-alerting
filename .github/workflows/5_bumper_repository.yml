@@ -132,6 +132,11 @@ jobs:
           fi
           bash "${{ env.BUMP_SCRIPT_PATH }}" "${script_params[@]}"
 
+      - name: (TEST ONLY) Add extra reference file
+        if: inputs.revert != true
+        run: |
+          echo "Reference to ${{ github.ref_name }} added by bump (run ${{ github.run_id }})" > TEST_REVERT_REFERENCE.md
+
       - name: Check for changes
         id: check_changes
         if: inputs.revert != true
