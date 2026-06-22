@@ -40,7 +40,8 @@ on:
 
 jobs:
   branches:
-    runs-on: ubuntu-24.04
+    runs-on:
+      - codebuild-github-actions-codebuild-runner-indexer-amd-${{ github.run_id }}-${{ github.run_attempt }}
     outputs:
       common_utils_ref: ${{ steps.resolve.outputs.wazuh_indexer_common_utils_branch }}
     steps:
@@ -57,7 +58,8 @@ jobs:
           echo "Common Utils branch: ${{ steps.resolve.outputs.wazuh_indexer_common_utils_branch }}"
 
   get-version:
-    runs-on: ubuntu-24.04
+    runs-on:
+      - codebuild-github-actions-codebuild-runner-indexer-amd-${{ github.run_id }}-${{ github.run_attempt }}
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -68,7 +70,8 @@ jobs:
         run: echo "version=$(jq -r .version<VERSION.json)" >> "$GITHUB_OUTPUT"
 
   publish-common-utils:
-    runs-on: ubuntu-24.04
+    runs-on:
+      - codebuild-github-actions-codebuild-runner-indexer-amd-${{ github.run_id }}-${{ github.run_attempt }}
     needs: [branches, get-version]
     steps:
       - name: Publish to Maven Local
@@ -86,7 +89,8 @@ jobs:
   build:
     env:
       plugin_name: "wazuh-indexer-alerting"
-    runs-on: ubuntu-24.04
+    runs-on:
+      - codebuild-github-actions-codebuild-runner-indexer-amd-${{ github.run_id }}-${{ github.run_attempt }}
     needs: [branches, get-version, publish-common-utils]
     steps:
       - uses: actions/checkout@v6
@@ -104,7 +108,13 @@ jobs:
           key: ${{ github.run_id }}-common-utils
 
       - name: Build and Test
-        run: ./gradlew build "-Dversion=${{ needs.get-version.outputs.version }}" "-Drevision=${{ inputs.revision }}" -x integTest
+        run: |
+          id -u builder &>/dev/null || useradd -m builder
+          # Hand the build user the workspace and the restored Maven local cache.
+          cp -a "$HOME/.m2" /home/builder/.m2 2>/dev/null || true
+          chown -R builder:builder "$GITHUB_WORKSPACE" /home/builder
+          runuser -u builder -- env "JAVA_HOME=$JAVA_HOME" "PATH=$PATH" \
+          ./gradlew build "-Dversion=${{ needs.get-version.outputs.version }}" "-Drevision=${{ inputs.revision }}" -x integTest
         shell: bash
 
       - name: Prepare Artifacts
