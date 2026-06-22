@@ -318,6 +318,10 @@ class AlertIndices(
         }
     }
     suspend fun createOrUpdateInitialAlertHistoryIndex() {
+        // When alert history is disabled, avoid creatio of the history index
+        if (!alertHistoryEnabled) {
+            return
+        }
         if (!alertHistoryIndexInitialized) {
             alertHistoryIndexInitialized = createIndex(ALERT_HISTORY_INDEX_PATTERN, alertMapping(), ALERT_HISTORY_WRITE_INDEX)
             if (alertHistoryIndexInitialized)
@@ -332,6 +336,10 @@ class AlertIndices(
     }
 
     suspend fun createOrUpdateInitialFindingHistoryIndex() {
+        // When finding history is disabled, avoid creation of the history index
+        if (!findingHistoryEnabled) {
+            return
+        }
         if (!findingHistoryIndexInitialized) {
             findingHistoryIndexInitialized = createIndex(FINDING_HISTORY_INDEX_PATTERN, findingMapping(), FINDING_HISTORY_WRITE_INDEX)
             if (findingHistoryIndexInitialized) {

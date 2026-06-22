@@ -49,6 +49,34 @@ class AlertIndicesIT : AlertingRestTestCase() {
         assertIndexExists(AlertIndices.FINDING_HISTORY_WRITE_INDEX)
     }
 
+    fun `test alert history index is not created when alert history is disabled`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "false")
+        wipeAllODFEIndices()
+        assertIndexDoesNotExist(AlertIndices.ALERT_HISTORY_WRITE_INDEX)
+
+        executeMonitor(randomQueryLevelMonitor(triggers = listOf(randomQueryLevelTrigger(condition = ALWAYS_RUN))))
+
+        // The active alerts index is still created, but the history index must not be.
+        assertIndexExists(AlertIndices.ALERT_INDEX)
+        assertIndexDoesNotExist(AlertIndices.ALERT_HISTORY_WRITE_INDEX)
+    }
+
+    fun `test finding history index is not created when finding history is disabled`() {
+        client().updateSettings(AlertingSettings.FINDING_HISTORY_ENABLED.key, "false")
+        wipeAllODFEIndices()
+        assertIndexDoesNotExist(AlertIndices.FINDING_HISTORY_WRITE_INDEX)
+
+        val testIndex = createTestIndex()
+        val docQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "3", fields = listOf())
+        val docLevelInput = DocLevelMonitorInput("description", listOf(testIndex), listOf(docQuery))
+        val trigger = randomDocumentLevelTrigger(condition = ALWAYS_RUN)
+        val monitor = createMonitor(randomDocumentLevelMonitor(inputs = listOf(docLevelInput), triggers = listOf(trigger)))
+
+        executeMonitor(monitor.id)
+
+        assertIndexDoesNotExist(AlertIndices.FINDING_HISTORY_WRITE_INDEX)
+    }
+
     fun `test update alert index mapping with new schema version`() {
         client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         wipeAllODFEIndices()
