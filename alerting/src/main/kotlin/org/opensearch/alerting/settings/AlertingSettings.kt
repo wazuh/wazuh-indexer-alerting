@@ -154,7 +154,7 @@ class AlertingSettings {
         //  such that the main index is findings and rolls over to the finding history index
         val FINDING_HISTORY_ENABLED = Setting.boolSetting(
             "plugins.alerting.alert_finding_enabled",
-            true,
+            false,
             Setting.Property.NodeScope, Setting.Property.Dynamic
         )
 
@@ -256,7 +256,7 @@ class AlertingSettings {
 
         val ALERTING_COMMENTS_ENABLED = Setting.boolSetting(
             "plugins.alerting.comments_enabled",
-            true,
+            false,
             Setting.Property.NodeScope, Setting.Property.Dynamic
         )
 

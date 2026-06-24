@@ -48,6 +48,7 @@ import org.opensearch.alerting.settings.AlertingSettings.Companion.DOC_LEVEL_MON
 import org.opensearch.alerting.settings.AlertingSettings.Companion.DOC_LEVEL_MONITOR_FETCH_ONLY_QUERY_FIELDS_ENABLED
 import org.opensearch.alerting.settings.AlertingSettings.Companion.DOC_LEVEL_MONITOR_SHARD_FETCH_SIZE
 import org.opensearch.alerting.settings.AlertingSettings.Companion.FINDINGS_INDEXING_BATCH_SIZE
+import org.opensearch.alerting.settings.AlertingSettings.Companion.FINDING_HISTORY_ENABLED
 import org.opensearch.alerting.settings.AlertingSettings.Companion.MAX_ACTIONABLE_ALERT_COUNT
 import org.opensearch.alerting.settings.AlertingSettings.Companion.PERCOLATE_QUERY_DOCS_SIZE_MEMORY_PERCENTAGE_LIMIT
 import org.opensearch.alerting.settings.AlertingSettings.Companion.PERCOLATE_QUERY_MAX_NUM_DOCS_IN_MEMORY
@@ -167,6 +168,10 @@ class TransportDocLevelMonitorFanOutAction
     @Volatile var allowList: List<String> = DestinationSettings.ALLOW_LIST.get(settings)
     @Volatile var fetchOnlyQueryFieldNames = DOC_LEVEL_MONITOR_FETCH_ONLY_QUERY_FIELDS_ENABLED.get(settings)
 
+    // When finding history is disabled, findings are not persisted to the findings index (e.g. .opensearch-sap-*-findings-*).
+    // Enrichment and trigger evaluation still run; only the write/auto-creation of the findings index is skipped.
+    @Volatile var findingHistoryEnabled = FINDING_HISTORY_ENABLED.get(settings)
+
     init {
         clusterService.clusterSettings.addSettingsUpdateConsumer(PERCOLATE_QUERY_MAX_NUM_DOCS_IN_MEMORY) {
             percQueryMaxNumDocsInMemory = it
@@ -194,6 +199,9 @@ class TransportDocLevelMonitorFanOutAction
         }
         clusterService.clusterSettings.addSettingsUpdateConsumer(DOC_LEVEL_MONITOR_FETCH_ONLY_QUERY_FIELDS_ENABLED) {
             fetchOnlyQueryFieldNames = it
+        }
+        clusterService.clusterSettings.addSettingsUpdateConsumer(FINDING_HISTORY_ENABLED) {
+            findingHistoryEnabled = it
         }
     }
 
@@ -599,7 +607,7 @@ class TransportDocLevelMonitorFanOutAction
                     .string()
             log.trace("Findings: $findingStr")
 
-            if (shouldCreateFinding and (
+            if (findingHistoryEnabled and shouldCreateFinding and (
                 monitor.shouldCreateSingleAlertForFindings == null ||
                     monitor.shouldCreateSingleAlertForFindings == false
                 )

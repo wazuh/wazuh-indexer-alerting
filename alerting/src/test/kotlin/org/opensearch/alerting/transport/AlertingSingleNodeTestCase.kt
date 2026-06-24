@@ -505,6 +505,8 @@ abstract class AlertingSingleNodeTestCase : OpenSearchSingleNodeTestCase() {
             .put(super.nodeSettings())
             .put("opendistro.scheduled_jobs.sweeper.period", TimeValue(5, TimeUnit.SECONDS))
             .put("opendistro.scheduled_jobs.enabled", true)
+            .put("plugins.alerting.alert_history_enabled", true)
+            .put("plugins.alerting.alert_finding_enabled", true)
             .build()
     }
 }
