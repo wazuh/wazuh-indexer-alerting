@@ -22,7 +22,7 @@ import java.util.concurrent.TimeUnit
 class DocLeveFanOutIT : AlertingRestTestCase() {
 
     fun `test execution reaches endtime before completing execution`() {
-        val updateSettings1 = adminClient().updateSettings(AlertingSettings.FINDING_HISTORY_ENABLED.key, false)
+        val updateSettings1 = adminClient().updateSettings(AlertingSettings.FINDING_HISTORY_ENABLED.key, true)
         logger.info(updateSettings1)
         val testIndex = createTestIndex()
         val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))

@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit
 class AlertIndicesIT : AlertingRestTestCase() {
 
     fun `test create alert index`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         executeMonitor(randomQueryLevelMonitor(triggers = listOf(randomQueryLevelTrigger(condition = ALWAYS_RUN))))
 
         assertIndexExists(AlertIndices.ALERT_INDEX)
@@ -36,6 +37,7 @@ class AlertIndicesIT : AlertingRestTestCase() {
     }
 
     fun `test create finding index`() {
+        client().updateSettings(AlertingSettings.FINDING_HISTORY_ENABLED.key, "true")
         val testIndex = createTestIndex()
         val docQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "3", fields = listOf())
         val docLevelInput = DocLevelMonitorInput("description", listOf(testIndex), listOf(docQuery))
@@ -47,7 +49,36 @@ class AlertIndicesIT : AlertingRestTestCase() {
         assertIndexExists(AlertIndices.FINDING_HISTORY_WRITE_INDEX)
     }
 
+    fun `test alert history index is not created when alert history is disabled`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "false")
+        wipeAllODFEIndices()
+        assertIndexDoesNotExist(AlertIndices.ALERT_HISTORY_WRITE_INDEX)
+
+        executeMonitor(randomQueryLevelMonitor(triggers = listOf(randomQueryLevelTrigger(condition = ALWAYS_RUN))))
+
+        // The active alerts index is still created, but the history index must not be.
+        assertIndexExists(AlertIndices.ALERT_INDEX)
+        assertIndexDoesNotExist(AlertIndices.ALERT_HISTORY_WRITE_INDEX)
+    }
+
+    fun `test finding history index is not created when finding history is disabled`() {
+        client().updateSettings(AlertingSettings.FINDING_HISTORY_ENABLED.key, "false")
+        wipeAllODFEIndices()
+        assertIndexDoesNotExist(AlertIndices.FINDING_HISTORY_WRITE_INDEX)
+
+        val testIndex = createTestIndex()
+        val docQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "3", fields = listOf())
+        val docLevelInput = DocLevelMonitorInput("description", listOf(testIndex), listOf(docQuery))
+        val trigger = randomDocumentLevelTrigger(condition = ALWAYS_RUN)
+        val monitor = createMonitor(randomDocumentLevelMonitor(inputs = listOf(docLevelInput), triggers = listOf(trigger)))
+
+        executeMonitor(monitor.id)
+
+        assertIndexDoesNotExist(AlertIndices.FINDING_HISTORY_WRITE_INDEX)
+    }
+
     fun `test update alert index mapping with new schema version`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         wipeAllODFEIndices()
         assertIndexDoesNotExist(AlertIndices.ALERT_INDEX)
         assertIndexDoesNotExist(AlertIndices.ALERT_HISTORY_WRITE_INDEX)
@@ -70,6 +101,7 @@ class AlertIndicesIT : AlertingRestTestCase() {
     }
 
     fun `test update finding index mapping with new schema version`() {
+        client().updateSettings(AlertingSettings.FINDING_HISTORY_ENABLED.key, "true")
         wipeAllODFEIndices()
         assertIndexDoesNotExist(AlertIndices.FINDING_HISTORY_WRITE_INDEX)
 
@@ -93,6 +125,7 @@ class AlertIndicesIT : AlertingRestTestCase() {
     }
 
     fun `test alert index gets recreated automatically if deleted`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         wipeAllODFEIndices()
         assertIndexDoesNotExist(AlertIndices.ALERT_INDEX)
         val trueMonitor = randomQueryLevelMonitor(triggers = listOf(randomQueryLevelTrigger(condition = ALWAYS_RUN)))
@@ -111,6 +144,7 @@ class AlertIndicesIT : AlertingRestTestCase() {
     }
 
     fun `test finding index gets recreated automatically if deleted`() {
+        client().updateSettings(AlertingSettings.FINDING_HISTORY_ENABLED.key, "true")
         wipeAllODFEIndices()
         assertIndexDoesNotExist(AlertIndices.FINDING_HISTORY_WRITE_INDEX)
         val testIndex = createTestIndex()
@@ -132,7 +166,8 @@ class AlertIndicesIT : AlertingRestTestCase() {
     }
 
     fun `test rollover alert history index`() {
-        // Update the rollover check to be every 1 second and the index max age to be 1 second
+        // Enable alert history (disabled by default) and configure fast rollover
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         client().updateSettings(AlertingSettings.ALERT_HISTORY_ROLLOVER_PERIOD.key, "1s")
         client().updateSettings(AlertingSettings.ALERT_HISTORY_INDEX_MAX_AGE.key, "1s")
 
@@ -147,7 +182,8 @@ class AlertIndicesIT : AlertingRestTestCase() {
     }
 
     fun `test rollover finding history index`() {
-        // Update the rollover check to be every 1 second and the index max age to be 1 second
+        // Enable finding history (disabled by default) and configure fast rollover
+        client().updateSettings(AlertingSettings.FINDING_HISTORY_ENABLED.key, "true")
         client().updateSettings(AlertingSettings.FINDING_HISTORY_ROLLOVER_PERIOD.key, "1s")
         client().updateSettings(AlertingSettings.FINDING_HISTORY_INDEX_MAX_AGE.key, "1s")
 
