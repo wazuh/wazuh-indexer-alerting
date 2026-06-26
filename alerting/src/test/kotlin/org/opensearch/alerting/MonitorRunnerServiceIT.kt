@@ -11,6 +11,7 @@ import org.opensearch.alerting.model.destination.CustomWebhook
 import org.opensearch.alerting.model.destination.Destination
 import org.opensearch.alerting.model.destination.email.Email
 import org.opensearch.alerting.model.destination.email.Recipient
+import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.alerting.util.DestinationType
 import org.opensearch.alerting.util.getBucketKeysHash
 import org.opensearch.client.Request
@@ -285,6 +286,7 @@ class MonitorRunnerServiceIT : AlertingRestTestCase() {
     }
 
     fun `test alert completion`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         val trigger = randomQueryLevelTrigger(condition = Script("ctx.alert == null"), destinationId = createDestination().id)
         val monitor = createMonitor(randomQueryLevelMonitor(triggers = listOf(trigger)))
 
@@ -511,6 +513,7 @@ class MonitorRunnerServiceIT : AlertingRestTestCase() {
     }
 
     fun `test latest error is not lost when alert is completed`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         // Creates an active alert the first time it's run and completes it the second time the monitor is run.
         val trigger = randomQueryLevelTrigger(
             condition = Script(
@@ -751,6 +754,7 @@ class MonitorRunnerServiceIT : AlertingRestTestCase() {
     }
 
     fun `test monitor with throttled action for different alerts`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         val actionThrottleEnabled = randomAction(
             template = randomTemplateScript("Hello {{ctx.monitor.name}}"),
             destinationId = createDestination().id,
@@ -1430,6 +1434,7 @@ class MonitorRunnerServiceIT : AlertingRestTestCase() {
     }
 
     fun `test bucket-level monitor alert creation and completion`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         val testIndex = createTestIndex()
         insertSampleTimeSerializedData(
             testIndex,
@@ -1497,6 +1502,7 @@ class MonitorRunnerServiceIT : AlertingRestTestCase() {
     }
 
     fun `test bucket-level monitor with acknowledged alert`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         val testIndex = createTestIndex()
         insertSampleTimeSerializedData(
             testIndex,
@@ -1955,6 +1961,7 @@ class MonitorRunnerServiceIT : AlertingRestTestCase() {
     }
 
     fun `test bucket-level monitor with per alert action scope saves completed alerts even if not actionable`() {
+        client().updateSettings(AlertingSettings.ALERT_HISTORY_ENABLED.key, "true")
         val testIndex = createTestIndex()
         insertSampleTimeSerializedData(
             testIndex,

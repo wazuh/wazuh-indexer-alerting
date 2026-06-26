@@ -303,6 +303,10 @@ class AlertIndices(
         if (dataSources.alertsIndex == ALERT_INDEX) {
             return createOrUpdateInitialAlertHistoryIndex()
         }
+        // When alert history is disabled, avoid creation of the custom history index (e.g. .opensearch-sap-*-alerts-history-*)
+        if (!alertHistoryEnabled) {
+            return
+        }
         if (!clusterService.state().metadata.hasAlias(dataSources.alertsHistoryIndex)) {
             createIndex(
                 dataSources.alertsHistoryIndexPattern ?: ALERT_HISTORY_INDEX_PATTERN,
@@ -318,6 +322,10 @@ class AlertIndices(
         }
     }
     suspend fun createOrUpdateInitialAlertHistoryIndex() {
+        // When alert history is disabled, avoid creatio of the history index
+        if (!alertHistoryEnabled) {
+            return
+        }
         if (!alertHistoryIndexInitialized) {
             alertHistoryIndexInitialized = createIndex(ALERT_HISTORY_INDEX_PATTERN, alertMapping(), ALERT_HISTORY_WRITE_INDEX)
             if (alertHistoryIndexInitialized)
@@ -332,6 +340,10 @@ class AlertIndices(
     }
 
     suspend fun createOrUpdateInitialFindingHistoryIndex() {
+        // When finding history is disabled, avoid creation of the history index
+        if (!findingHistoryEnabled) {
+            return
+        }
         if (!findingHistoryIndexInitialized) {
             findingHistoryIndexInitialized = createIndex(FINDING_HISTORY_INDEX_PATTERN, findingMapping(), FINDING_HISTORY_WRITE_INDEX)
             if (findingHistoryIndexInitialized) {
@@ -349,6 +361,10 @@ class AlertIndices(
     suspend fun createOrUpdateInitialFindingHistoryIndex(dataSources: DataSources) {
         if (dataSources.findingsIndex == FINDING_HISTORY_WRITE_INDEX) {
             return createOrUpdateInitialFindingHistoryIndex()
+        }
+        // When finding history is disabled, avoid creation of the custom findings index (e.g. .opensearch-sap-*-findings-*)
+        if (!findingHistoryEnabled) {
+            return
         }
         val findingsIndex = dataSources.findingsIndex
         val findingsIndexPattern = dataSources.findingsIndexPattern ?: FINDING_HISTORY_INDEX_PATTERN

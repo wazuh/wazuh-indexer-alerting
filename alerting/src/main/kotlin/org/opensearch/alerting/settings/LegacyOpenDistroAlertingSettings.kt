@@ -67,7 +67,7 @@ class LegacyOpenDistroAlertingSettings {
 
         val ALERT_HISTORY_ENABLED = Setting.boolSetting(
             "opendistro.alerting.alert_history_enabled",
-            true,
+            false,
             Setting.Property.NodeScope, Setting.Property.Dynamic, Setting.Property.Deprecated
         )
 

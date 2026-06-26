@@ -275,6 +275,10 @@ testClusters.integTest {
 
 testClusters.integTest.nodes.each { node ->
     node.setting("plugins.destination.host.deny_list", "[\"10.0.0.0/8\", \"127.0.0.1\"]")
+    // Alert/finding history default to false; integration tests exercise finding/alert-history
+    // logic, so enable them on the test cluster (mirrors AlertingSingleNodeTestCase node settings).
+    node.setting("plugins.alerting.alert_history_enabled", "true")
+    node.setting("plugins.alerting.alert_finding_enabled", "true")
 
     if (securityEnabled) {
         node.extraConfigFile("kirk.pem", file("build/resources/main/kirk.pem"))
