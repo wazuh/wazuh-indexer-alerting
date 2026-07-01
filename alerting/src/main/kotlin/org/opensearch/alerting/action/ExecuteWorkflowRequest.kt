@@ -63,7 +63,6 @@ class ExecuteWorkflowRequest : ActionRequest {
     override fun writeTo(out: StreamOutput) {
         out.writeBoolean(dryrun)
         out.writeTimeValue(requestEnd)
-        out.writeOptionalTimeValue(requestStart)
         out.writeOptionalString(workflowId)
         if (workflow != null) {
             out.writeBoolean(true)
@@ -71,5 +70,6 @@ class ExecuteWorkflowRequest : ActionRequest {
         } else {
             out.writeBoolean(false)
         }
+        out.writeOptionalTimeValue(requestStart)
     }
 }
