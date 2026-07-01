@@ -103,7 +103,7 @@ class TransportExecuteWorkflowAction @Inject constructor(
                     object : ActionListener<GetResponse> {
                         override fun onResponse(response: GetResponse) {
                             if (!response.isExists) {
-                                log.error("Can't find workflow with id: ${response.id}")
+                                log.warn("Can't find workflow with id: ${response.id}")
                                 actionListener.onFailure(
                                     AlertingException.wrap(
                                         OpenSearchStatusException(
