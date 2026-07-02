@@ -3,6 +3,7 @@ package org.opensearch.alerting.core.lock
 import org.apache.logging.log4j.LogManager
 import org.opensearch.ResourceAlreadyExistsException
 import org.opensearch.action.DocWriteResponse
+import org.opensearch.action.NoShardAvailableActionException
 import org.opensearch.action.admin.indices.create.CreateIndexRequest
 import org.opensearch.action.admin.indices.create.CreateIndexResponse
 import org.opensearch.action.delete.DeleteRequest
@@ -101,7 +102,12 @@ class LockService(private val client: Client, private val clusterService: Cluste
                                     }
 
                                     override fun onFailure(e: Exception) {
-                                        listener.onFailure(e)
+                                        if (e is NoShardAvailableActionException) {
+                                            log.warn("Lock index shard not available, will retry on next execution: {}", e.message)
+                                            listener.onResponse(null)
+                                        } else {
+                                            listener.onFailure(e)
+                                        }
                                     }
                                 }
                             )
@@ -221,7 +227,11 @@ class LockService(private val client: Client, private val clusterService: Cluste
                 }
 
                 override fun onFailure(e: Exception) {
-                    log.error("Exception occurred finding lock", e)
+                    if (e is NoShardAvailableActionException) {
+                        log.warn("Lock index shard not available: {}", e.message)
+                    } else {
+                        log.error("Exception occurred finding lock", e)
+                    }
                     listener.onFailure(e)
                 }
             }
@@ -233,7 +243,7 @@ class LockService(private val client: Client, private val clusterService: Cluste
         listener: ActionListener<Boolean>
     ) {
         if (lock == null) {
-            log.error("Lock is null. Nothing to release.")
+            log.debug("Lock is null. Nothing to release.")
             listener.onResponse(false)
         } else {
             log.debug("Releasing lock: {}", lock)
@@ -293,11 +303,11 @@ class LockService(private val client: Client, private val clusterService: Cluste
                     }
 
                     override fun onFailure(ex: Exception) {
-                        log.error("Failed to update config index schema", ex)
                         if (ex is ResourceAlreadyExistsException || ex.cause is ResourceAlreadyExistsException
                         ) {
                             listener.onResponse(true)
                         } else {
+                            log.error("Failed to update config index schema", ex)
                             listener.onFailure(ex)
                         }
                     }
