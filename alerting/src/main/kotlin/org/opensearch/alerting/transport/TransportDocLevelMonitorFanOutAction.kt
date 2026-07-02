@@ -12,8 +12,6 @@ import org.apache.logging.log4j.LogManager
 import org.opensearch.OpenSearchSecurityException
 import org.opensearch.OpenSearchStatusException
 import org.opensearch.action.DocWriteRequest
-import org.opensearch.action.admin.indices.refresh.RefreshAction
-import org.opensearch.action.admin.indices.refresh.RefreshRequest
 import org.opensearch.action.bulk.BackoffPolicy
 import org.opensearch.action.bulk.BulkRequest
 import org.opensearch.action.bulk.BulkResponse
@@ -658,7 +656,6 @@ class TransportDocLevelMonitorFanOutAction
                 log.debug("[${bulkResponse.items.size}] All findings successfully indexed.")
             }
         }
-        client.execute(RefreshAction.INSTANCE, RefreshRequest(monitor.dataSources.findingsIndex))
     }
 
     private fun publishFinding(
