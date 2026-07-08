@@ -27,11 +27,15 @@ class AlertingSettings {
         const val DEFAULT_FAN_OUT_NODES = 1000
         const val DEFAULT_MAX_TRIGGERS_PER_MONITOR = 10
 
-        const val DEFAULT_MAX_MONITORS = 10
+        private const val MAXIMUM_MAX_MONITORS = 10
+        const val DEFAULT_MAX_MONITORS = MAXIMUM_MAX_MONITORS
+        private const val MINIMUM_MAX_MONITORS = 0
 
         val ALERTING_MAX_MONITORS = Setting.intSetting(
             "plugins.alerting.monitor.max_monitors",
             DEFAULT_MAX_MONITORS,
+            MINIMUM_MAX_MONITORS,
+            MAXIMUM_MAX_MONITORS,
             Setting.Property.NodeScope, Setting.Property.Dynamic
         )
 
