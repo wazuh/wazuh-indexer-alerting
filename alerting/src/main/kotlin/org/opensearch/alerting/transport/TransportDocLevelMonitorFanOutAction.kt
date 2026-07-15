@@ -154,7 +154,6 @@ class TransportDocLevelMonitorFanOutAction
     var docTransformTimeTakenStat = 0L
     var totalDocsSizeInBytesStat = 0L
     var docsSizeOfBatchInBytes = 0L
-    var findingsToTriggeredQueries: Map<String, List<DocLevelQuery>> = mutableMapOf()
 
     @Volatile var percQueryMaxNumDocsInMemory: Int = PERCOLATE_QUERY_MAX_NUM_DOCS_IN_MEMORY.get(settings)
     @Volatile var docLevelMonitorFanoutMaxDuration = DOC_LEVEL_MONITOR_FANOUT_MAX_DURATION.get(settings)
@@ -240,6 +239,9 @@ class TransportDocLevelMonitorFanOutAction
             val docsToQueries = mutableMapOf<String, MutableList<String>>()
             val transformedDocs = mutableListOf<Pair<String, TransformedDocDto>>()
             val findingIdToDocSource = mutableMapOf<String, MultiGetItemResponse>()
+            // Request-scoped so it does not accumulate across monitor executions on the node-lifetime
+            // singleton instance (see wazuh/wazuh-indexer#1746). Only read within this executeMonitor call.
+            val findingsToTriggeredQueries = mutableMapOf<String, List<DocLevelQuery>>()
             val isTempMonitor = dryrun || monitor.id == Monitor.NO_ID
 
             val docLevelMonitorInput = request.monitor.inputs[0] as DocLevelMonitorInput
@@ -312,7 +314,7 @@ class TransportDocLevelMonitorFanOutAction
             // If there are no triggers defined, we still want to generate findings
             if (monitor.triggers.isEmpty()) {
                 if (dryrun == false && monitor.id != Monitor.NO_ID) {
-                    createFindings(monitor, docsToQueries, idQueryMap, true)
+                    createFindings(monitor, docsToQueries, idQueryMap, findingsToTriggeredQueries, true)
                 }
             } else {
                 /**
@@ -331,6 +333,7 @@ class TransportDocLevelMonitorFanOutAction
                             dryrun,
                             executionId = executionId,
                             findingIdToDocSource,
+                            findingsToTriggeredQueries,
                             workflowRunContext = workflowRunContext
                         )
                     }
@@ -452,6 +455,7 @@ class TransportDocLevelMonitorFanOutAction
         dryrun: Boolean,
         executionId: String,
         findingIdToDocSource: MutableMap<String, MultiGetItemResponse>,
+        findingsToTriggeredQueries: MutableMap<String, List<DocLevelQuery>>,
         workflowRunContext: WorkflowRunContext?
     ): DocumentLevelTriggerRunResult {
         val triggerCtx = DocumentLevelTriggerExecutionContext(monitor, trigger, clusterSettings = clusterService.clusterSettings)
@@ -464,6 +468,7 @@ class TransportDocLevelMonitorFanOutAction
             monitor,
             docsToQueries,
             idQueryMap,
+            findingsToTriggeredQueries,
             !dryrun && monitor.id != Monitor.NO_ID,
             executionId
         )
@@ -570,6 +575,7 @@ class TransportDocLevelMonitorFanOutAction
         monitor: Monitor,
         docsToQueries: MutableMap<String, MutableList<String>>,
         idQueryMap: Map<String, DocLevelQuery>,
+        findingsToTriggeredQueries: MutableMap<String, List<DocLevelQuery>>,
         shouldCreateFinding: Boolean,
         workflowExecutionId: String? = null,
     ): List<Pair<String, String>> {
@@ -577,7 +583,6 @@ class TransportDocLevelMonitorFanOutAction
         val findingDocPairs = mutableListOf<Pair<String, String>>()
         val findings = mutableListOf<Finding>()
         val indexRequests = mutableListOf<IndexRequest>()
-        val findingsToTriggeredQueries = mutableMapOf<String, List<DocLevelQuery>>()
 
         docsToQueries.forEach {
             val triggeredQueries = it.value.map { queryId -> idQueryMap[queryId]!! }
@@ -633,7 +638,6 @@ class TransportDocLevelMonitorFanOutAction
                 }
             }
         }
-        this.findingsToTriggeredQueries += findingsToTriggeredQueries
 
         return findingDocPairs
     }
