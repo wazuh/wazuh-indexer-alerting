@@ -233,7 +233,7 @@ class LockService(private val client: Client, private val clusterService: Cluste
         listener: ActionListener<Boolean>
     ) {
         if (lock == null) {
-            log.error("Lock is null. Nothing to release.")
+            log.debug("Lock is null. Nothing to release.")
             listener.onResponse(false)
         } else {
             log.debug("Releasing lock: {}", lock)

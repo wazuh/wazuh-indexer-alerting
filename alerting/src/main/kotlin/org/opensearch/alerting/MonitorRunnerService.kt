@@ -93,6 +93,10 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
 
     private val logger = LogManager.getLogger(javaClass)
 
+    // Handles the narrow race where the .opensearch-alerting-config-lock index is still being
+    // auto-created the very first time a job runs and isn't yet gettable on this node.
+    private val LOCK_ACQUIRE_BACKOFF_POLICY = BackoffPolicy.exponentialBackoff(TimeValue.timeValueMillis(50), 3)
+
     var monitorCtx: MonitorRunnerExecutionContext = MonitorRunnerExecutionContext()
     private lateinit var runnerSupervisor: Job
     override val coroutineContext: CoroutineContext
@@ -349,8 +353,10 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                 launch {
                     var workflowLock: LockModel? = null
                     try {
-                        workflowLock = monitorCtx.client!!.suspendUntil<Client, LockModel?> {
-                            monitorCtx.lockService!!.acquireLock(job, it)
+                        workflowLock = LOCK_ACQUIRE_BACKOFF_POLICY.retry(logger, listOf(RestStatus.NOT_FOUND)) {
+                            monitorCtx.client!!.suspendUntil<Client, LockModel?> {
+                                monitorCtx.lockService!!.acquireLock(job, it)
+                            }
                         } ?: return@launch
                         logger.debug("lock ${workflowLock.lockId} acquired")
 
@@ -370,8 +376,10 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                     } catch (e: Exception) {
                         logger.error("Workflow run failed for workflow with id ${job.id}", e)
                     } finally {
-                        monitorCtx.client!!.suspendUntil<Client, Boolean> { monitorCtx.lockService!!.release(workflowLock, it) }
-                        logger.debug("lock ${workflowLock?.lockId} released")
+                        workflowLock?.let { lock ->
+                            monitorCtx.client!!.suspendUntil<Client, Boolean> { monitorCtx.lockService!!.release(lock, it) }
+                            logger.debug("lock ${lock.lockId} released")
+                        }
                     }
                 }
             }
@@ -379,8 +387,10 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                 launch {
                     var monitorLock: LockModel? = null
                     try {
-                        monitorLock = monitorCtx.client!!.suspendUntil<Client, LockModel?> {
-                            monitorCtx.lockService!!.acquireLock(job, it)
+                        monitorLock = LOCK_ACQUIRE_BACKOFF_POLICY.retry(logger, listOf(RestStatus.NOT_FOUND)) {
+                            monitorCtx.client!!.suspendUntil<Client, LockModel?> {
+                                monitorCtx.lockService!!.acquireLock(job, it)
+                            }
                         } ?: return@launch
                         logger.debug("lock ${monitorLock.lockId} acquired")
                         logger.debug(
@@ -404,8 +414,10 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                     } catch (e: Exception) {
                         logger.error("Monitor run failed for monitor with id ${job.id}", e)
                     } finally {
-                        monitorCtx.client!!.suspendUntil<Client, Boolean> { monitorCtx.lockService!!.release(monitorLock, it) }
-                        logger.debug("lock ${monitorLock?.lockId} released")
+                        monitorLock?.let { lock ->
+                            monitorCtx.client!!.suspendUntil<Client, Boolean> { monitorCtx.lockService!!.release(lock, it) }
+                            logger.debug("lock ${lock.lockId} released")
+                        }
                     }
                 }
             }
