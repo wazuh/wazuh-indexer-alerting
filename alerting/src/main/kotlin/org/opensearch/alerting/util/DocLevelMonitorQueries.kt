@@ -5,6 +5,7 @@
 
 package org.opensearch.alerting.util
 
+import kotlinx.coroutines.delay
 import org.apache.logging.log4j.LogManager
 import org.opensearch.ExceptionsHelper
 import org.opensearch.OpenSearchStatusException
@@ -510,13 +511,16 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             // queryIndex is alias which will always have only 1 backing index which is writeIndex
             // This is due to a fact that that _rollover API would maintain only single index under alias
             // if you don't add is_write_index setting when creating index initially
-            targetQueryIndex = getWriteIndexNameForAlias(monitor.dataSources.queryIndex)
+            targetQueryIndex = getWriteIndexNameForAliasWithRetry(monitor.dataSources.queryIndex)
             if (targetQueryIndex == null) {
-                val message = "Failed to get write index for queryIndex alias:${monitor.dataSources.queryIndex}"
-                log.error(message)
-                throw AlertingException.wrap(
-                    OpenSearchStatusException(message, RestStatus.INTERNAL_SERVER_ERROR)
+                // The alias' write-index metadata can lag briefly behind an index creation/rollover on this
+                // node's local cluster state view. Skip this run instead of failing the whole monitor; the
+                // next scheduled run will pick it up once the cluster state has caught up.
+                log.warn(
+                    "Write index for queryIndex alias:${monitor.dataSources.queryIndex} not resolved after " +
+                        "retries. Skipping this run for source index [$sourceIndex]."
                 )
+                return Pair(AcknowledgedResponse(false), "")
             }
             monitorMetadata.sourceToQueryIndexMapping[sourceIndex + monitor.id] = targetQueryIndex
         }
@@ -735,6 +739,15 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             )
         }
         return response.newIndex
+    }
+
+    private suspend fun getWriteIndexNameForAliasWithRetry(alias: String, maxAttempts: Int = 3): String? {
+        repeat(maxAttempts) { attempt ->
+            val writeIndex = getWriteIndexNameForAlias(alias)
+            if (writeIndex != null) return writeIndex
+            if (attempt < maxAttempts - 1) delay(100L * (attempt + 1))
+        }
+        return null
     }
 
     private fun getWriteIndexNameForAlias(alias: String): String? {
