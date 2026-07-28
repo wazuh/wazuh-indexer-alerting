@@ -1,43 +1,24 @@
-# CHANGELOG
-
-All notable changes to this project are documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See the [CONTRIBUTING guide](./CONTRIBUTING.md#Changelog) for instructions on how to add changelog entries.
-
 ## [v5.0.0]
 
 ### Added
 
-- Repo initialization [(#2)](https://github.com/wazuh/wazuh-indexer-alerting/pull/2)
-- Add Support Revert Bump Functionality [(#23)](https://github.com/wazuh/wazuh-indexer-alerting/pull/23)
-- Implement dedicated monitor for Active Response [(#66)](https://github.com/wazuh/wazuh-indexer-alerting/pull/66)
-
-### Dependencies
-
--
+- Initialize `wazuh-indexer-alerting` repository [(#1)](https://github.com/wazuh/wazuh-indexer-alerting/issues/1) [(#3)](https://github.com/wazuh/wazuh-indexer-alerting/issues/3)
+- Support Revert bump functionality in wazuh-indexer-alerting [(#19)](https://github.com/wazuh/wazuh-indexer-alerting/issues/19)
+- Implement dedicated monitor for Active Response [(#8)](https://github.com/wazuh/wazuh-indexer-alerting/issues/8)
+- Configurable resource creation limits [(#1276)](https://github.com/wazuh/wazuh-indexer-plugins/issues/1276)
 
 ### Changed
 
-- Reduce alerting plugin log verbosity [(#25)](https://github.com/wazuh/wazuh-indexer-alerting/pull/25)
-
-### Deprecated
-
--
+- Alerting logs review [(#7)](https://github.com/wazuh/wazuh-indexer-alerting/issues/7)
 
 ### Removed
 
 -
 
 ### Fixed
-- Fix publish-findings forEach try/catch dropping rest of batch on first error [(#49)](https://github.com/wazuh/wazuh-indexer-alerting/pull/49)
-- Fix SLF4J startup warning by adding Log4j2 provider [(#74)](https://github.com/wazuh/wazuh-indexer-alerting/pull/74)
-
-  
-
-### Security
-
+- RCA: missing findings [(#168)](https://github.com/wazuh/wazuh-indexer-security-analytics/issues/168)
+- SLF4J "no provider" warnings during startup [(#1577)](https://github.com/wazuh/wazuh-indexer/issues/1577)
+- java.lang.OutOfMemoryError: Java heap space in Soak agent tests [(#1746)](https://github.com/wazuh/wazuh-indexer/issues/1746)
 
 ## Prior versions
 - []()
-
-[Unreleased 5.0.x]: https://github.com/wazuh/wazuh-indexer-alerting/compare/f4b9eb4fb9a698ff40648d4adac808c83d9d4cf7...main
