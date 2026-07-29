@@ -7,6 +7,7 @@ package org.opensearch.alerting.transport
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.apache.logging.log4j.LogManager
 import org.opensearch.ExceptionsHelper
@@ -31,6 +32,8 @@ import org.opensearch.action.support.WriteRequest.RefreshPolicy
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse
 import org.opensearch.alerting.MonitorMetadataService
 import org.opensearch.alerting.core.ScheduledJobIndices
+import org.opensearch.alerting.core.lock.LockModel
+import org.opensearch.alerting.core.lock.LockService
 import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.service.DeleteMonitorService
 import org.opensearch.alerting.settings.AlertingSettings
@@ -91,12 +94,18 @@ import java.util.Locale
 private val log = LogManager.getLogger(TransportIndexMonitorAction::class.java)
 private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
 
+/** Synthetic lock ID guarding the [org.opensearch.alerting.settings.AlertingSettings.ALERTING_MAX_MONITORS] limit-check-then-create sequence. */
+private const val MAX_MONITORS_LOCK_ID = "max-monitors-limit"
+private const val MAX_MONITORS_LOCK_ACQUIRE_RETRIES = 20
+private const val MAX_MONITORS_LOCK_ACQUIRE_RETRY_BACKOFF_MILLIS = 100L
+
 class TransportIndexMonitorAction @Inject constructor(
     transportService: TransportService,
     val client: Client,
     actionFilters: ActionFilters,
     val scheduledJobIndices: ScheduledJobIndices,
     val docLevelMonitorQueries: DocLevelMonitorQueries,
+    val lockService: LockService,
     val clusterService: ClusterService,
     val settings: Settings,
     val xContentRegistry: NamedXContentRegistry,
@@ -401,24 +410,78 @@ class TransportIndexMonitorAction @Inject constructor(
                     indexMonitor()
                 }
             } else {
-                val query = QueryBuilders.boolQuery()
-                    .filter(QueryBuilders.termQuery("${Monitor.MONITOR_TYPE}.type", Monitor.MONITOR_TYPE))
-                    .mustNot(QueryBuilders.termQuery("${Monitor.MONITOR_TYPE}.${Monitor.OWNER_FIELD}", "security_analytics"))
-                val searchSource = SearchSourceBuilder().query(query).timeout(requestTimeout)
-                val searchRequest = SearchRequest(SCHEDULED_JOBS_INDEX).source(searchSource)
+                // Serialize the limit-check-then-create sequence so concurrent requests cannot
+                // all observe a stale count and overshoot max_monitors. The lock is released once
+                // the count-check (and, if it passes, the monitor creation) fully completes.
+                scope.launch {
+                    var lock: LockModel? = null
+                    try {
+                        lock = acquireMaxMonitorsLock()
+                        val query = QueryBuilders.boolQuery()
+                            .filter(QueryBuilders.termQuery("${Monitor.MONITOR_TYPE}.type", Monitor.MONITOR_TYPE))
+                            .mustNot(QueryBuilders.termQuery("${Monitor.MONITOR_TYPE}.${Monitor.OWNER_FIELD}", "security_analytics"))
+                        val searchSource = SearchSourceBuilder().query(query).timeout(requestTimeout)
+                        val searchRequest = SearchRequest(SCHEDULED_JOBS_INDEX).source(searchSource)
+                        val searchResponse: SearchResponse = client.suspendUntil { client.search(searchRequest, it) }
 
-                client.search(
-                    searchRequest,
-                    object : ActionListener<SearchResponse> {
-                        override fun onResponse(searchResponse: SearchResponse) {
-                            onSearchResponse(searchResponse)
+                        val totalHits = searchResponse.hits.totalHits?.value
+                        if (totalHits != null && totalHits >= maxMonitors) {
+                            log.info("This request would create more than the allowed monitors [$maxMonitors].")
+                            actionListener.onFailure(
+                                AlertingException.wrap(
+                                    IllegalArgumentException(
+                                        "This request would create more than the allowed monitors [$maxMonitors]."
+                                    )
+                                )
+                            )
+                        } else {
+                            indexMonitor()
                         }
-
-                        override fun onFailure(t: Exception) {
-                            actionListener.onFailure(AlertingException.wrap(t))
-                        }
+                    } catch (t: Exception) {
+                        actionListener.onFailure(AlertingException.wrap(t))
+                    } finally {
+                        lock?.let { releaseMaxMonitorsLock(it) }
                     }
-                )
+                }
+            }
+        }
+
+        /**
+         * Acquires the mutex guarding the [maxMonitors] limit-check-then-create sequence, retrying
+         * with bounded backoff until it becomes available.
+         *
+         * @throws OpenSearchStatusException (429) if the lock could not be acquired after
+         *   [MAX_MONITORS_LOCK_ACQUIRE_RETRIES] attempts.
+         */
+        private suspend fun acquireMaxMonitorsLock(): LockModel {
+            var attempt = 0
+            while (true) {
+                attempt++
+                val lock: LockModel? = client.suspendUntil { lockService.acquireLockWithId(MAX_MONITORS_LOCK_ID, it) }
+                if (lock != null) {
+                    return lock
+                }
+                if (attempt >= MAX_MONITORS_LOCK_ACQUIRE_RETRIES) {
+                    throw OpenSearchStatusException(
+                        "Too many concurrent monitor creation requests, please retry.",
+                        RestStatus.TOO_MANY_REQUESTS
+                    )
+                }
+                delay(MAX_MONITORS_LOCK_ACQUIRE_RETRY_BACKOFF_MILLIS)
+            }
+        }
+
+        /**
+         * Releases a previously acquired [maxMonitors] lock. Failures are logged and swallowed so a
+         * release problem never surfaces as a monitor-creation failure; [LockService] considers a
+         * lock older than [org.opensearch.alerting.core.lock.LockService.LOCK_EXPIRED_MINUTES]
+         * stale and lets the next caller steal it regardless.
+         */
+        private suspend fun releaseMaxMonitorsLock(lock: LockModel) {
+            try {
+                client.suspendUntil<Client, Boolean> { lockService.release(lock, it) }
+            } catch (e: Exception) {
+                log.warn("Failed to release max-monitors lock: ${e.message}")
             }
         }
 
@@ -443,27 +506,6 @@ class TransportIndexMonitorAction @Inject constructor(
                             { "Can only set throttle period greater than or equal to $minValue" }
                         )
                     }
-                }
-            }
-        }
-
-        /**
-         * After searching for all existing monitors we validate the system can support another monitor to be created.
-         */
-        private fun onSearchResponse(response: SearchResponse) {
-            val totalHits = response.hits.totalHits?.value
-            if (totalHits != null && totalHits >= maxMonitors) {
-                log.info("This request would create more than the allowed monitors [$maxMonitors].")
-                actionListener.onFailure(
-                    AlertingException.wrap(
-                        IllegalArgumentException(
-                            "This request would create more than the allowed monitors [$maxMonitors]."
-                        )
-                    )
-                )
-            } else {
-                scope.launch {
-                    indexMonitor()
                 }
             }
         }
