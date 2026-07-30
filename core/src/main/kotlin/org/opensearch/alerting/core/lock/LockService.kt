@@ -1,6 +1,7 @@
 package org.opensearch.alerting.core.lock
 
 import org.apache.logging.log4j.LogManager
+import org.opensearch.OpenSearchException
 import org.opensearch.ResourceAlreadyExistsException
 import org.opensearch.action.DocWriteResponse
 import org.opensearch.action.admin.indices.create.CreateIndexRequest
@@ -13,6 +14,7 @@ import org.opensearch.action.index.IndexRequest
 import org.opensearch.action.index.IndexResponse
 import org.opensearch.action.update.UpdateRequest
 import org.opensearch.action.update.UpdateResponse
+import org.opensearch.alerting.opensearchapi.isRetriable
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
 import org.opensearch.common.unit.TimeValue
@@ -221,7 +223,14 @@ class LockService(private val client: Client, private val clusterService: Cluste
                 }
 
                 override fun onFailure(e: Exception) {
-                    log.error("Exception occurred finding lock", e)
+                    if (e is OpenSearchException && e.isRetriable()) {
+                        // Transient failures (e.g. the lock index shard is still recovering right after
+                        // it was created) are expected and get retried by the caller, so a stack trace here
+                        // would be misleading noise rather than an actionable error.
+                        log.warn("Transient failure finding lock, will retry: {}", e.message)
+                    } else {
+                        log.error("Exception occurred finding lock", e)
+                    }
                     listener.onFailure(e)
                 }
             }
@@ -293,11 +302,12 @@ class LockService(private val client: Client, private val clusterService: Cluste
                     }
 
                     override fun onFailure(ex: Exception) {
-                        log.error("Failed to update config index schema", ex)
-                        if (ex is ResourceAlreadyExistsException || ex.cause is ResourceAlreadyExistsException
-                        ) {
+                        if (ex is ResourceAlreadyExistsException || ex.cause is ResourceAlreadyExistsException) {
+                            // Benign race: another node/thread created the lock index concurrently.
+                            log.debug("Lock index already exists. {}", ex.message)
                             listener.onResponse(true)
                         } else {
+                            log.error("Failed to update config index schema", ex)
                             listener.onFailure(ex)
                         }
                     }
