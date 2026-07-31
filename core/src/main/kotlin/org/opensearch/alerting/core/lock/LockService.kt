@@ -1,7 +1,6 @@
 package org.opensearch.alerting.core.lock
 
 import org.apache.logging.log4j.LogManager
-import org.opensearch.OpenSearchException
 import org.opensearch.ResourceAlreadyExistsException
 import org.opensearch.action.DocWriteResponse
 import org.opensearch.action.admin.indices.create.CreateIndexRequest
@@ -14,7 +13,6 @@ import org.opensearch.action.index.IndexRequest
 import org.opensearch.action.index.IndexResponse
 import org.opensearch.action.update.UpdateRequest
 import org.opensearch.action.update.UpdateResponse
-import org.opensearch.alerting.opensearchapi.isRetriable
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
 import org.opensearch.common.unit.TimeValue
@@ -52,6 +50,20 @@ class LockService(private val client: Client, private val clusterService: Cluste
 
     fun lockIndexExist(): Boolean {
         return clusterService.state().routingTable().hasIndex(LOCK_INDEX_NAME)
+    }
+
+    /**
+     * True when the lock index can actually serve reads, i.e. its primary shard is active.
+     *
+     * [lockIndexExist] is a plain lookup on the routing table, so it returns true from the moment the index
+     * enters the cluster state even though its shard may still be recovering. On a node recovering 108
+     * indices that window was measured at 8.5 seconds, during which every caller that did not create the
+     * index itself ran straight into NoShardAvailableActionException. Reporting the index as unavailable
+     * instead lets the caller skip the run and pick it up on the next tick.
+     */
+    private fun lockIndexReady(): Boolean {
+        val indexRouting = clusterService.state().routingTable().index(LOCK_INDEX_NAME) ?: return false
+        return indexRouting.allPrimaryShardsActive()
     }
 
     fun acquireLock(
@@ -112,6 +124,9 @@ class LockService(private val client: Client, private val clusterService: Cluste
                             listener.onResponse(null)
                         }
                     } else {
+                        // The lock index is not serving reads yet. Treated like a lock held by someone else:
+                        // the caller skips this run and the job executes on its next tick.
+                        log.debug("Lock index is not ready, skipping lock acquisition for {}", scheduledJobId)
                         listener.onResponse(null)
                     }
                 }
@@ -223,14 +238,9 @@ class LockService(private val client: Client, private val clusterService: Cluste
                 }
 
                 override fun onFailure(e: Exception) {
-                    if (e is OpenSearchException && e.isRetriable()) {
-                        // Transient failures (e.g. the lock index shard is still recovering right after
-                        // it was created) are expected and get retried by the caller, so a stack trace here
-                        // would be misleading noise rather than an actionable error.
-                        log.warn("Transient failure finding lock, will retry: {}", e.message)
-                    } else {
-                        log.error("Exception occurred finding lock", e)
-                    }
+                    // Whether this failure is transient depends on the caller's retry policy, which this class
+                    // cannot know. Propagate it and let the caller report it; the trace stays available at debug.
+                    log.debug("Exception occurred finding lock", e)
                     listener.onFailure(e)
                 }
             }
@@ -290,7 +300,7 @@ class LockService(private val client: Client, private val clusterService: Cluste
 
     private fun createLockIndex(listener: ActionListener<Boolean>) {
         if (lockIndexExist()) {
-            listener.onResponse(true)
+            listener.onResponse(lockIndexReady())
         } else {
             val indexRequest = CreateIndexRequest(LOCK_INDEX_NAME).mapping(lockMapping())
                 .settings(Settings.builder().put("index.hidden", true).build())
@@ -303,9 +313,10 @@ class LockService(private val client: Client, private val clusterService: Cluste
 
                     override fun onFailure(ex: Exception) {
                         if (ex is ResourceAlreadyExistsException || ex.cause is ResourceAlreadyExistsException) {
-                            // Benign race: another node/thread created the lock index concurrently.
+                            // Benign race: another node/thread created the lock index concurrently. Winning the
+                            // create is what waits for the shard, so losing it says nothing about readiness.
                             log.debug("Lock index already exists. {}", ex.message)
-                            listener.onResponse(true)
+                            listener.onResponse(lockIndexReady())
                         } else {
                             log.error("Failed to update config index schema", ex)
                             listener.onFailure(ex)

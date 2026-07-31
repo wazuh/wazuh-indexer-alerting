@@ -93,8 +93,10 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
 
     private val logger = LogManager.getLogger(javaClass)
 
-    // Handles the narrow race where the .opensearch-alerting-config-lock index is still being
-    // auto-created the very first time a job runs and isn't yet gettable on this node.
+    // Covers genuinely transient failures while acquiring a job lock. It deliberately does NOT try to wait
+    // out the startup window in which the .opensearch-alerting-config-lock shard is still recovering: that
+    // was measured at 8.5s on a node recovering 108 indices, far beyond any sane budget here. That case is
+    // handled in LockService, which reports the index as unavailable so the run is skipped until next tick.
     private val LOCK_ACQUIRE_BACKOFF_POLICY = BackoffPolicy.exponentialBackoff(TimeValue.timeValueMillis(50), 3)
 
     var monitorCtx: MonitorRunnerExecutionContext = MonitorRunnerExecutionContext()
@@ -353,7 +355,11 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                 launch {
                     var workflowLock: LockModel? = null
                     try {
-                        workflowLock = LOCK_ACQUIRE_BACKOFF_POLICY.retry(logger, listOf(RestStatus.NOT_FOUND)) {
+                        workflowLock = LOCK_ACQUIRE_BACKOFF_POLICY.retry(
+                            logger,
+                            listOf(RestStatus.NOT_FOUND),
+                            logRetryStackTrace = false
+                        ) {
                             monitorCtx.client!!.suspendUntil<Client, LockModel?> {
                                 monitorCtx.lockService!!.acquireLock(job, it)
                             }
@@ -387,7 +393,11 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                 launch {
                     var monitorLock: LockModel? = null
                     try {
-                        monitorLock = LOCK_ACQUIRE_BACKOFF_POLICY.retry(logger, listOf(RestStatus.NOT_FOUND)) {
+                        monitorLock = LOCK_ACQUIRE_BACKOFF_POLICY.retry(
+                            logger,
+                            listOf(RestStatus.NOT_FOUND),
+                            logRetryStackTrace = false
+                        ) {
                             monitorCtx.client!!.suspendUntil<Client, LockModel?> {
                                 monitorCtx.lockService!!.acquireLock(job, it)
                             }
