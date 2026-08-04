@@ -16,6 +16,7 @@ import org.mockito.Mockito.never
 import org.mockito.Mockito.verify
 import org.mockito.Mockito.`when`
 import org.opensearch.action.NoShardAvailableActionException
+import org.opensearch.action.admin.indices.create.CreateIndexResponse
 import org.opensearch.action.get.GetResponse
 import org.opensearch.cluster.ClusterState
 import org.opensearch.cluster.routing.IndexRoutingTable
@@ -24,7 +25,9 @@ import org.opensearch.cluster.service.ClusterService
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.index.shard.ShardId
 import org.opensearch.test.OpenSearchTestCase
+import org.opensearch.transport.client.AdminClient
 import org.opensearch.transport.client.Client
+import org.opensearch.transport.client.IndicesAdminClient
 
 class LockServiceTests : OpenSearchTestCase() {
     fun `test release null is a no-op`() {
@@ -88,7 +91,7 @@ class LockServiceTests : OpenSearchTestCase() {
      */
     fun `test acquireLock skips the run while the lock index primary is inactive`() {
         val client = mock(Client::class.java)
-        val lockService = LockService(client, clusterServiceWithLockIndex(primaryActive = false))
+        val lockService = LockService(client, clusterServiceWithLockIndex(exists = true, primaryActive = false))
 
         var responded = false
         var lock: LockModel? = LockModel("some-job-id", java.time.Instant.now(), false)
@@ -112,7 +115,47 @@ class LockServiceTests : OpenSearchTestCase() {
         verify(client, never()).get(any(), any())
     }
 
-    private fun clusterServiceWithLockIndex(primaryActive: Boolean): ClusterService {
+    /**
+     * A create request only waits for an active primary until its ack timeout expires, after which the index
+     * is acknowledged while still unable to serve reads. The caller that won the create must skip the run
+     * too, otherwise it is the one left hitting NoShardAvailableActionException.
+     */
+    fun `test acquireLock skips the run when creating the lock index does not acknowledge its shards`() {
+        val client = mock(Client::class.java)
+        val adminClient = mock(AdminClient::class.java)
+        val indicesAdminClient = mock(IndicesAdminClient::class.java)
+        `when`(client.admin()).thenReturn(adminClient)
+        `when`(adminClient.indices()).thenReturn(indicesAdminClient)
+        doAnswer { invocation ->
+            val listener = invocation.getArgument<ActionListener<CreateIndexResponse>>(1)
+            listener.onResponse(CreateIndexResponse(true, false, LockService.LOCK_INDEX_NAME))
+            null
+        }.`when`(indicesAdminClient).create(any(), any())
+
+        val lockService = LockService(client, clusterServiceWithLockIndex(exists = false, primaryActive = false))
+
+        var responded = false
+        var lock: LockModel? = LockModel("some-job-id", java.time.Instant.now(), false)
+        lockService.acquireLockWithId(
+            "some-job-id",
+            object : ActionListener<LockModel?> {
+                override fun onResponse(response: LockModel?) {
+                    responded = true
+                    lock = response
+                }
+
+                override fun onFailure(e: Exception) {
+                    fail("Unexpected failure: ${e.message}")
+                }
+            }
+        )
+
+        assertTrue(responded)
+        assertNull(lock)
+        verify(client, never()).get(any(), any())
+    }
+
+    private fun clusterServiceWithLockIndex(exists: Boolean, primaryActive: Boolean): ClusterService {
         val clusterService = mock(ClusterService::class.java)
         val clusterState = mock(ClusterState::class.java)
         val routingTable = mock(RoutingTable::class.java)
@@ -120,8 +163,8 @@ class LockServiceTests : OpenSearchTestCase() {
 
         `when`(clusterService.state()).thenReturn(clusterState)
         `when`(clusterState.routingTable()).thenReturn(routingTable)
-        `when`(routingTable.hasIndex(LockService.LOCK_INDEX_NAME)).thenReturn(true)
-        `when`(routingTable.index(LockService.LOCK_INDEX_NAME)).thenReturn(indexRoutingTable)
+        `when`(routingTable.hasIndex(LockService.LOCK_INDEX_NAME)).thenReturn(exists)
+        `when`(routingTable.index(LockService.LOCK_INDEX_NAME)).thenReturn(if (exists) indexRoutingTable else null)
         `when`(indexRoutingTable.allPrimaryShardsActive()).thenReturn(primaryActive)
 
         return clusterService

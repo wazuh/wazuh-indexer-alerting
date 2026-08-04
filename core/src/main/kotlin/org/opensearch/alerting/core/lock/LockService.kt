@@ -60,8 +60,11 @@ class LockService(private val client: Client, private val clusterService: Cluste
      * indices that window was measured at 8.5 seconds, during which every caller that did not create the
      * index itself ran straight into NoShardAvailableActionException. Reporting the index as unavailable
      * instead lets the caller skip the run and pick it up on the next tick.
+     *
+     * Public so a caller can tell why [acquireLock] answered null: a null lock means either that someone
+     * else holds it or that the index is not serving reads yet, and those deserve different handling.
      */
-    private fun lockIndexReady(): Boolean {
+    fun lockIndexReady(): Boolean {
         val indexRouting = clusterService.state().routingTable().index(LOCK_INDEX_NAME) ?: return false
         return indexRouting.allPrimaryShardsActive()
     }
@@ -308,13 +311,17 @@ class LockService(private val client: Client, private val clusterService: Cluste
                 indexRequest,
                 object : ActionListener<CreateIndexResponse> {
                     override fun onResponse(response: CreateIndexResponse) {
-                        listener.onResponse(response.isAcknowledged)
+                        // isAcknowledged only covers the cluster state update. The request also waits for the
+                        // primary to become active (waitForActiveShards defaults to ActiveShardCount.DEFAULT)
+                        // but gives up after its ack timeout, reporting isShardsAcknowledged = false while the
+                        // index is acknowledged yet still unable to serve reads. Both must hold.
+                        listener.onResponse(response.isAcknowledged && response.isShardsAcknowledged)
                     }
 
                     override fun onFailure(ex: Exception) {
                         if (ex is ResourceAlreadyExistsException || ex.cause is ResourceAlreadyExistsException) {
-                            // Benign race: another node/thread created the lock index concurrently. Winning the
-                            // create is what waits for the shard, so losing it says nothing about readiness.
+                            // Benign race: another node/thread created the lock index concurrently. Only the
+                            // winner of the create waits for the shard, so losing it says nothing about readiness.
                             log.debug("Lock index already exists. {}", ex.message)
                             listener.onResponse(lockIndexReady())
                         } else {
