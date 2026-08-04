@@ -1011,6 +1011,22 @@ class TransportDocLevelMonitorFanOutAction
         concreteIndices: List<String>,
         monitorInputIndices: List<String>,
     ): SearchHits {
+        // A source index has no query index when indexing its queries was skipped this run, e.g. because the
+        // queryIndex alias could not be resolved. Percolating its docs would either send a null index to the
+        // search request or hit an index that no longer exists, so drop them and report it once per batch.
+        val unmappedSourceIndices = docs.map { it.second.indexName }.distinct()
+            .filter { monitorMetadata.sourceToQueryIndexMapping[it + monitor.id] == null }
+        if (unmappedSourceIndices.isNotEmpty()) {
+            log.warn(
+                "Monitor ${monitor.id}: no query index resolved for source index(es) $unmappedSourceIndices. " +
+                    "Skipping their documents in this run."
+            )
+            docs.removeAll { it.second.indexName in unmappedSourceIndices }
+            if (docs.isEmpty()) {
+                return SearchHits.empty()
+            }
+        }
+
         val indices = docs.stream().map { it.second.indexName }.distinct().collect(Collectors.toList())
         val boolQueryBuilder = BoolQueryBuilder().must(buildShouldClausesOverPerIndexMatchQueries(indices))
         val percolateQueryBuilder =
@@ -1020,7 +1036,7 @@ class TransportDocLevelMonitorFanOutAction
         }
         boolQueryBuilder.filter(percolateQueryBuilder)
         val queryIndices =
-            docs.map { monitorMetadata.sourceToQueryIndexMapping[it.second.indexName + monitor.id] }.distinct()
+            docs.mapNotNull { monitorMetadata.sourceToQueryIndexMapping[it.second.indexName + monitor.id] }.distinct()
         if (queryIndices.isEmpty()) {
             val message =
                 "Monitor ${monitor.id}: Failed to resolve query Indices from source indices during monitor execution!" +
