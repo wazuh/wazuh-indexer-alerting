@@ -5,6 +5,7 @@
 
 package org.opensearch.alerting.util
 
+import kotlinx.coroutines.delay
 import org.apache.logging.log4j.LogManager
 import org.opensearch.ExceptionsHelper
 import org.opensearch.OpenSearchStatusException
@@ -265,6 +266,9 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
 
         val indices = docLevelMonitorInput.indices
         val clusterState = clusterService.state()
+        // Every source index of this monitor resolves the same queryIndex alias, so once the alias is known to
+        // be unresolvable there is no point in paying the retry delay again for each remaining source index.
+        val queryIndexResolver = QueryIndexWriteIndexResolver()
 
         // Run through each backing index and apply appropriate mappings to query index
         indices.forEach { indexName ->
@@ -362,7 +366,8 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                 updatedIndexName,
                 sourceIndexFieldLimit,
                 updatedProperties,
-                indexTimeout
+                indexTimeout,
+                queryIndexResolver
             )
 
             if (updateMappingResponse.isAcknowledged) {
@@ -498,7 +503,8 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         sourceIndex: String,
         sourceIndexFieldLimit: Long,
         updatedProperties: MutableMap<String, Any>,
-        indexTimeout: TimeValue
+        indexTimeout: TimeValue,
+        queryIndexResolver: QueryIndexWriteIndexResolver = QueryIndexWriteIndexResolver()
     ): Pair<AcknowledgedResponse, String> {
         var targetQueryIndex = monitorMetadata.sourceToQueryIndexMapping[sourceIndex + monitor.id]
         if (
@@ -510,13 +516,21 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             // queryIndex is alias which will always have only 1 backing index which is writeIndex
             // This is due to a fact that that _rollover API would maintain only single index under alias
             // if you don't add is_write_index setting when creating index initially
-            targetQueryIndex = getWriteIndexNameForAlias(monitor.dataSources.queryIndex)
+            targetQueryIndex = queryIndexResolver.resolve(monitor.dataSources.queryIndex)
             if (targetQueryIndex == null) {
-                val message = "Failed to get write index for queryIndex alias:${monitor.dataSources.queryIndex}"
-                log.error(message)
-                throw AlertingException.wrap(
-                    OpenSearchStatusException(message, RestStatus.INTERNAL_SERVER_ERROR)
+                // The alias' write-index metadata can lag briefly behind an index creation/rollover on this
+                // node's local cluster state view. Skip this run instead of failing the whole monitor; the
+                // next scheduled run will pick it up once the cluster state has caught up.
+                //
+                // Drop any previously mapped concrete index for this source index: no queries were indexed for
+                // it in this run, and the mapping may point at an index that was just deleted and recreated.
+                // Leaving it in place would make the fan-out percolate against a stale or missing index.
+                monitorMetadata.sourceToQueryIndexMapping.remove(sourceIndex + monitor.id)
+                log.warn(
+                    "Monitor ${monitor.id}: write index for queryIndex alias:${monitor.dataSources.queryIndex} " +
+                        "not resolved after retries. Skipping this run for source index [$sourceIndex]."
                 )
+                return Pair(AcknowledgedResponse(false), "")
             }
             monitorMetadata.sourceToQueryIndexMapping[sourceIndex + monitor.id] = targetQueryIndex
         }
@@ -735,6 +749,29 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             )
         }
         return response.newIndex
+    }
+
+    /**
+     * Resolves the write index behind a monitor's queryIndex alias, remembering a failure for the rest of the
+     * run. A successful resolution is never cached: [rolloverQueryIndex] can move the alias mid-run, so each
+     * source index must see the current write index.
+     */
+    private inner class QueryIndexWriteIndexResolver {
+        private var unresolved = false
+
+        suspend fun resolve(alias: String): String? {
+            if (unresolved) return null
+            return getWriteIndexNameForAliasWithRetry(alias).also { if (it == null) unresolved = true }
+        }
+    }
+
+    private suspend fun getWriteIndexNameForAliasWithRetry(alias: String, maxAttempts: Int = 3): String? {
+        repeat(maxAttempts) { attempt ->
+            val writeIndex = getWriteIndexNameForAlias(alias)
+            if (writeIndex != null) return writeIndex
+            if (attempt < maxAttempts - 1) delay(100L * (attempt + 1))
+        }
+        return null
     }
 
     private fun getWriteIndexNameForAlias(alias: String): String? {
