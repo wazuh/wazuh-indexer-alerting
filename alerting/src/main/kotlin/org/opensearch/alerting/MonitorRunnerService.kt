@@ -93,6 +93,12 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
 
     private val logger = LogManager.getLogger(javaClass)
 
+    // Covers genuinely transient failures while acquiring a job lock. It deliberately does NOT try to wait
+    // out the startup window in which the .opensearch-alerting-config-lock shard is still recovering: that
+    // was measured at 8.5s on a node recovering 108 indices, far beyond any sane budget here. That case is
+    // handled in LockService, which reports the index as unavailable so the run is skipped until next tick.
+    private val LOCK_ACQUIRE_BACKOFF_POLICY = BackoffPolicy.exponentialBackoff(TimeValue.timeValueMillis(50), 3)
+
     var monitorCtx: MonitorRunnerExecutionContext = MonitorRunnerExecutionContext()
     private lateinit var runnerSupervisor: Job
     override val coroutineContext: CoroutineContext
@@ -349,9 +355,7 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                 launch {
                     var workflowLock: LockModel? = null
                     try {
-                        workflowLock = monitorCtx.client!!.suspendUntil<Client, LockModel?> {
-                            monitorCtx.lockService!!.acquireLock(job, it)
-                        } ?: return@launch
+                        workflowLock = acquireJobLock(job) ?: return@launch
                         logger.debug("lock ${workflowLock.lockId} acquired")
 
                         monitorCtx.client!!.suspendUntil<Client, ExecuteWorkflowResponse> {
@@ -370,8 +374,7 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                     } catch (e: Exception) {
                         logger.error("Workflow run failed for workflow with id ${job.id}", e)
                     } finally {
-                        monitorCtx.client!!.suspendUntil<Client, Boolean> { monitorCtx.lockService!!.release(workflowLock, it) }
-                        logger.debug("lock ${workflowLock?.lockId} released")
+                        workflowLock?.let { releaseJobLock(it) }
                     }
                 }
             }
@@ -379,9 +382,7 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                 launch {
                     var monitorLock: LockModel? = null
                     try {
-                        monitorLock = monitorCtx.client!!.suspendUntil<Client, LockModel?> {
-                            monitorCtx.lockService!!.acquireLock(job, it)
-                        } ?: return@launch
+                        monitorLock = acquireJobLock(job) ?: return@launch
                         logger.debug("lock ${monitorLock.lockId} acquired")
                         logger.debug(
                             "PERF_DEBUG: executing ${job.monitorType} ${job.id} on node " +
@@ -404,8 +405,7 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                     } catch (e: Exception) {
                         logger.error("Monitor run failed for monitor with id ${job.id}", e)
                     } finally {
-                        monitorCtx.client!!.suspendUntil<Client, Boolean> { monitorCtx.lockService!!.release(monitorLock, it) }
-                        logger.debug("lock ${monitorLock?.lockId} released")
+                        monitorLock?.let { releaseJobLock(it) }
                     }
                 }
             }
@@ -413,6 +413,29 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                 throw IllegalArgumentException("Invalid job type")
             }
         }
+    }
+
+    /**
+     * Acquires the run lock for [job], retrying transient failures per [LOCK_ACQUIRE_BACKOFF_POLICY].
+     *
+     * Returns null when the lock could not be taken, either because another node holds it or because the
+     * lock index is not serving reads yet. Callers must skip the tick in that case; the job runs on the next
+     * one.
+     */
+    private suspend fun acquireJobLock(job: ScheduledJob): LockModel? =
+        LOCK_ACQUIRE_BACKOFF_POLICY.retry(
+            logger,
+            listOf(RestStatus.NOT_FOUND),
+            logRetryStackTrace = false
+        ) {
+            monitorCtx.client!!.suspendUntil<Client, LockModel?> {
+                monitorCtx.lockService!!.acquireLock(job, it)
+            }
+        }
+
+    private suspend fun releaseJobLock(lock: LockModel) {
+        monitorCtx.client!!.suspendUntil<Client, Boolean> { monitorCtx.lockService!!.release(lock, it) }
+        logger.debug("lock ${lock.lockId} released")
     }
 
     suspend fun runJob(
