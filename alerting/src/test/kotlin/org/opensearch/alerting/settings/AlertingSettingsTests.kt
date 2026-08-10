@@ -185,4 +185,37 @@ class AlertingSettingsTests : OpenSearchTestCase() {
             )
         )
     }
+
+    fun `test max monitors setting defaults to 10`() {
+        assertEquals(10, AlertingSettings.ALERTING_MAX_MONITORS.get(Settings.EMPTY))
+        assertEquals(10, AlertingSettings.DEFAULT_MAX_MONITORS)
+    }
+
+    fun `test max monitors setting has no upper bound`() {
+        val settings = Settings.builder()
+            .put("plugins.alerting.monitor.max_monitors", 100000)
+            .build()
+        assertEquals(100000, AlertingSettings.ALERTING_MAX_MONITORS.get(settings))
+
+        val maxIntSettings = Settings.builder()
+            .put("plugins.alerting.monitor.max_monitors", Int.MAX_VALUE)
+            .build()
+        assertEquals(Int.MAX_VALUE, AlertingSettings.ALERTING_MAX_MONITORS.get(maxIntSettings))
+    }
+
+    fun `test max monitors setting accepts zero`() {
+        val settings = Settings.builder()
+            .put("plugins.alerting.monitor.max_monitors", 0)
+            .build()
+        assertEquals(0, AlertingSettings.ALERTING_MAX_MONITORS.get(settings))
+    }
+
+    fun `test max monitors setting rejects negative values`() {
+        val settings = Settings.builder()
+            .put("plugins.alerting.monitor.max_monitors", -1)
+            .build()
+        expectThrows(IllegalArgumentException::class.java) {
+            AlertingSettings.ALERTING_MAX_MONITORS.get(settings)
+        }
+    }
 }
