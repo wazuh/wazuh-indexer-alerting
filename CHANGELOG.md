@@ -19,6 +19,9 @@
 - RCA: missing findings [(#168)](https://github.com/wazuh/wazuh-indexer-security-analytics/issues/168)
 - SLF4J "no provider" warnings during startup [(#1577)](https://github.com/wazuh/wazuh-indexer/issues/1577)
 - java.lang.OutOfMemoryError: Java heap space in Soak agent tests [(#1746)](https://github.com/wazuh/wazuh-indexer/issues/1746)
+- Improve logs based on Analysis [(#1770)](https://github.com/wazuh/wazuh-indexer/issues/1770)
+- Fixed unresolved write-index alias errors in document-level monitors [(#1731)](https://github.com/wazuh/wazuh-indexer/issues/1731) [(#1730)](https://github.com/wazuh/wazuh-indexer/issues/1730)
+- Fix noisy error logs and workflow failures caused by lock acquisition race conditions [(#1730)](https://github.com/wazuh/wazuh-indexer/issues/1730)
 
 ## Prior versions
 - []()

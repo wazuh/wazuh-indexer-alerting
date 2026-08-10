@@ -101,11 +101,14 @@ suspend fun <T> BackoffPolicy.retryForNotification(
  *
  * @param logger - logger used to log intermediate failures
  * @param retryOn - any additional [RestStatus] values that should be retried
+ * @param logRetryStackTrace - whether intermediate failures are logged with their stack trace. Callers retrying an
+ *   expected, transient condition should pass `false` to keep the log readable; the trace is still logged at debug.
  * @param block - the block of code to retry. This should be a suspend function.
  */
 suspend fun <T> BackoffPolicy.retry(
     logger: Logger,
     retryOn: List<RestStatus> = emptyList(),
+    logRetryStackTrace: Boolean = true,
     block: suspend () -> T
 ): T {
     val iter = iterator()
@@ -115,7 +118,12 @@ suspend fun <T> BackoffPolicy.retry(
         } catch (e: OpenSearchException) {
             if (iter.hasNext() && (e.isRetriable() || retryOn.contains(e.status()))) {
                 val backoff = iter.next()
-                logger.warn("Operation failed. Retrying in $backoff.", e)
+                if (logRetryStackTrace) {
+                    logger.warn("Operation failed. Retrying in $backoff.", e)
+                } else {
+                    logger.warn("Operation failed, retrying in {}: {}", backoff, e.message)
+                    logger.debug("Operation failed. Retrying in $backoff.", e)
+                }
                 delay(backoff.millis)
             } else {
                 throw e
