@@ -52,6 +52,23 @@ class LockService(private val client: Client, private val clusterService: Cluste
         return clusterService.state().routingTable().hasIndex(LOCK_INDEX_NAME)
     }
 
+    /**
+     * True when the lock index can actually serve reads, i.e. its primary shard is active.
+     *
+     * [lockIndexExist] is a plain lookup on the routing table, so it returns true from the moment the index
+     * enters the cluster state even though its shard may still be recovering. On a node recovering 108
+     * indices that window was measured at 8.5 seconds, during which every caller that did not create the
+     * index itself ran straight into NoShardAvailableActionException. Reporting the index as unavailable
+     * instead lets the caller skip the run and pick it up on the next tick.
+     *
+     * Public so a caller can tell why [acquireLock] answered null: a null lock means either that someone
+     * else holds it or that the index is not serving reads yet, and those deserve different handling.
+     */
+    fun lockIndexReady(): Boolean {
+        val indexRouting = clusterService.state().routingTable().index(LOCK_INDEX_NAME) ?: return false
+        return indexRouting.allPrimaryShardsActive()
+    }
+
     fun acquireLock(
         scheduledJob: ScheduledJob,
         listener: ActionListener<LockModel?>
@@ -110,6 +127,9 @@ class LockService(private val client: Client, private val clusterService: Cluste
                             listener.onResponse(null)
                         }
                     } else {
+                        // The lock index is not serving reads yet. Treated like a lock held by someone else:
+                        // the caller skips this run and the job executes on its next tick.
+                        log.debug("Lock index is not ready, skipping lock acquisition for {}", scheduledJobId)
                         listener.onResponse(null)
                     }
                 }
@@ -221,7 +241,9 @@ class LockService(private val client: Client, private val clusterService: Cluste
                 }
 
                 override fun onFailure(e: Exception) {
-                    log.error("Exception occurred finding lock", e)
+                    // Whether this failure is transient depends on the caller's retry policy, which this class
+                    // cannot know. Propagate it and let the caller report it; the trace stays available at debug.
+                    log.debug("Exception occurred finding lock", e)
                     listener.onFailure(e)
                 }
             }
@@ -233,7 +255,7 @@ class LockService(private val client: Client, private val clusterService: Cluste
         listener: ActionListener<Boolean>
     ) {
         if (lock == null) {
-            log.error("Lock is null. Nothing to release.")
+            log.debug("Lock is null. Nothing to release.")
             listener.onResponse(false)
         } else {
             log.debug("Releasing lock: {}", lock)
@@ -281,7 +303,7 @@ class LockService(private val client: Client, private val clusterService: Cluste
 
     private fun createLockIndex(listener: ActionListener<Boolean>) {
         if (lockIndexExist()) {
-            listener.onResponse(true)
+            listener.onResponse(lockIndexReady())
         } else {
             val indexRequest = CreateIndexRequest(LOCK_INDEX_NAME).mapping(lockMapping())
                 .settings(Settings.builder().put("index.hidden", true).build())
@@ -289,15 +311,21 @@ class LockService(private val client: Client, private val clusterService: Cluste
                 indexRequest,
                 object : ActionListener<CreateIndexResponse> {
                     override fun onResponse(response: CreateIndexResponse) {
-                        listener.onResponse(response.isAcknowledged)
+                        // isAcknowledged only covers the cluster state update. The request also waits for the
+                        // primary to become active (waitForActiveShards defaults to ActiveShardCount.DEFAULT)
+                        // but gives up after its ack timeout, reporting isShardsAcknowledged = false while the
+                        // index is acknowledged yet still unable to serve reads. Both must hold.
+                        listener.onResponse(response.isAcknowledged && response.isShardsAcknowledged)
                     }
 
                     override fun onFailure(ex: Exception) {
-                        log.error("Failed to update config index schema", ex)
-                        if (ex is ResourceAlreadyExistsException || ex.cause is ResourceAlreadyExistsException
-                        ) {
-                            listener.onResponse(true)
+                        if (ex is ResourceAlreadyExistsException || ex.cause is ResourceAlreadyExistsException) {
+                            // Benign race: another node/thread created the lock index concurrently. Only the
+                            // winner of the create waits for the shard, so losing it says nothing about readiness.
+                            log.debug("Lock index already exists. {}", ex.message)
+                            listener.onResponse(lockIndexReady())
                         } else {
+                            log.error("Failed to update config index schema", ex)
                             listener.onFailure(ex)
                         }
                     }
