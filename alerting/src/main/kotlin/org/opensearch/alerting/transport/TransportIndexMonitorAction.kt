@@ -450,7 +450,9 @@ class TransportIndexMonitorAction @Inject constructor(
          * Acquires the mutex guarding the [maxMonitors] limit-check-then-create sequence, retrying
          * with bounded backoff until it becomes available.
          *
-         * @throws OpenSearchStatusException (429) if the lock could not be acquired after
+         * @throws OpenSearchStatusException (503) if the lock index is not serving reads yet, e.g.
+         *   while its shard recovers shortly after a node start.
+         * @throws OpenSearchStatusException (429) if the lock stayed held by other requests for all
          *   [MAX_MONITORS_LOCK_ACQUIRE_RETRIES] attempts.
          */
         private suspend fun acquireMaxMonitorsLock(): LockModel {
@@ -462,6 +464,14 @@ class TransportIndexMonitorAction @Inject constructor(
                     return lock
                 }
                 if (attempt >= MAX_MONITORS_LOCK_ACQUIRE_RETRIES) {
+                    // A null lock means either that another request holds it or that the lock index cannot
+                    // serve reads yet. Only the former is contention, so don't report both as 429.
+                    if (!lockService.lockIndexReady()) {
+                        throw OpenSearchStatusException(
+                            "The alerting lock index is not available yet, please retry.",
+                            RestStatus.SERVICE_UNAVAILABLE
+                        )
+                    }
                     throw OpenSearchStatusException(
                         "Too many concurrent monitor creation requests, please retry.",
                         RestStatus.TOO_MANY_REQUESTS

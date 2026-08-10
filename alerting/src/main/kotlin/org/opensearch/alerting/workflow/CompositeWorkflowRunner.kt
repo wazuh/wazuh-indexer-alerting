@@ -6,6 +6,7 @@
 package org.opensearch.alerting.workflow
 
 import org.apache.logging.log4j.LogManager
+import org.opensearch.ExceptionsHelper
 import org.opensearch.action.search.SearchRequest
 import org.opensearch.action.search.SearchResponse
 import org.opensearch.alerting.BucketLevelMonitorRunner
@@ -40,6 +41,8 @@ import org.opensearch.index.query.QueryBuilders
 import org.opensearch.index.query.QueryBuilders.boolQuery
 import org.opensearch.index.query.QueryBuilders.existsQuery
 import org.opensearch.index.query.QueryBuilders.termsQuery
+import org.opensearch.node.NodeClosedException
+import org.opensearch.transport.NodeNotConnectedException
 import org.opensearch.transport.TransportService
 import java.time.Instant
 import java.time.LocalDateTime
@@ -180,10 +183,14 @@ object CompositeWorkflowRunner : WorkflowRunner() {
             monitorCtx.alertIndices!!.createOrUpdateInitialAlertHistoryIndex(dataSources)
             monitorCtx.alertService!!.loadCurrentAlertsForWorkflow(workflow, dataSources)
         } catch (e: Exception) {
-            logger.error("Failed to fetch current alerts for workflow", e)
             // We can't save ERROR alerts to the index here as we don't know if there are existing ACTIVE alerts
             val id = if (workflow.id.trim().isEmpty()) "_na_" else workflow.id
-            logger.error("Error loading alerts for workflow: $id", e)
+            if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away: the run is abandoned, not failed.
+                logger.debug("Skipped loading alerts for workflow $id: node is closing", e)
+            } else {
+                logger.error("Error loading alerts for workflow: $id", e)
+            }
             return workflowRunResult.copy(error = e)
         }
         try {
@@ -406,4 +413,16 @@ object CompositeWorkflowRunner : WorkflowRunner() {
             Alert.State.AUDIT
         } else Alert.State.ACTIVE
     }
+}
+
+/**
+ * Returns true when [e], or the cause it wraps, means the local node is shutting down or a peer has
+ * gone away, rather than a genuine failure of the operation being attempted.
+ *
+ * Such a failure is a normal outcome of a restart: the run is abandoned and retried on the next
+ * schedule, so it does not warrant error-level logging.
+ */
+fun isNodeUnavailableFailure(e: Exception): Boolean {
+    val cause = ExceptionsHelper.unwrapCause(e)
+    return cause is NodeClosedException || cause is NodeNotConnectedException
 }
