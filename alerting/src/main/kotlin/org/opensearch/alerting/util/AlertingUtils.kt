@@ -27,7 +27,9 @@ import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
 import org.opensearch.commons.alerting.model.action.ActionExecutionScope
 import org.opensearch.commons.alerting.util.isBucketLevelMonitor
 import org.opensearch.commons.alerting.util.isMonitorOfStandardType
+import org.opensearch.node.NodeClosedException
 import org.opensearch.script.Script
+import org.opensearch.transport.NodeNotConnectedException
 import java.util.Locale
 import kotlin.math.max
 
@@ -290,4 +292,46 @@ fun printsSampleDocData(trigger: Trigger): Boolean {
         )
         validTags.any { tag -> action.messageTemplate.idOrCode.contains(tag) }
     }
+}
+
+/**
+ * Class names recorded by `AlertingException.wrap()` when it flattens a cause into
+ * `Exception("<class name>: <message>")`. The original exception type does not survive that
+ * flattening, so for a caller above the first conversion the recorded name is the only signal left.
+ */
+private val NODE_UNAVAILABLE_EXCEPTION_NAMES = setOf(
+    NodeClosedException::class.java.name,
+    NodeNotConnectedException::class.java.name
+)
+
+/** Guards against a self-referencing or pathologically deep cause chain. */
+private const val MAX_CAUSE_CHAIN_DEPTH = 10
+
+/**
+ * Returns true when [e], or any cause it wraps, means the local node is shutting down or a peer has
+ * gone away, rather than a genuine failure of the operation being attempted.
+ *
+ * Such a failure is a normal outcome of a restart: the run is abandoned and retried on the next
+ * schedule, so it does not warrant error-level logging.
+ *
+ * The whole chain is walked rather than just `ExceptionsHelper.unwrapCause()`, because
+ * `AlertingException` is not an `OpenSearchWrapperException` -- unwrapping stops at it -- and it
+ * flattens its cause, so a shutdown that has already been converted once is only recognisable by
+ * the class name that conversion recorded.
+ */
+fun isNodeUnavailableFailure(e: Exception): Boolean {
+    var cause: Throwable? = e
+    var depth = 0
+    while (cause != null && depth++ < MAX_CAUSE_CHAIN_DEPTH) {
+        if (cause is NodeClosedException || cause is NodeNotConnectedException) {
+            return true
+        }
+        val message = cause.message
+        if (message != null && NODE_UNAVAILABLE_EXCEPTION_NAMES.any { message.startsWith("$it:") }) {
+            return true
+        }
+        val next = cause.cause
+        cause = if (next === cause) null else next
+    }
+    return false
 }
