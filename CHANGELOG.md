@@ -23,6 +23,7 @@
 - Fixed unresolved write-index alias errors in document-level monitors [(#1731)](https://github.com/wazuh/wazuh-indexer/issues/1731) [(#1730)](https://github.com/wazuh/wazuh-indexer/issues/1730)
 - Fix noisy error logs and workflow failures caused by lock acquisition race conditions [(#1730)](https://github.com/wazuh/wazuh-indexer/issues/1730)
 - Recognise an orderly node shutdown in the remaining alerting error paths instead of logging it as a failure [(#1867)](https://github.com/wazuh/wazuh-indexer/issues/1867) [(#1788)](https://github.com/wazuh/wazuh-indexer/issues/1788)
+- Doc-level monitors no longer skip documents when search backpressure cancels their percolate search [(#ISSUE)](https://github.com/wazuh/wazuh-indexer/issues/ISSUE)
 
 ## Prior versions
 - []()

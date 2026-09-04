@@ -12,6 +12,22 @@ import org.opensearch.index.seqno.SequenceNumbers
 
 private val logger: Logger = LogManager.getLogger("FanOutEligibility")
 
+/**
+ * Commits every shard sequence number held back in [pendingSeqNos], then clears them.
+ *
+ * A doc-level monitor reads a shard in chunks but evaluates them a whole batch at a time, so a chunk's
+ * sequence number must not be recorded as covered until the percolate search for the batch holding it has
+ * succeeded. Advancing it on fetch instead is what let a refused search skip documents for good: the batch
+ * was discarded while the shard had already been moved past it.
+ *
+ * Call this only when the batch was evaluated. Leaving the entries pending is what makes the next run read
+ * those documents again.
+ */
+fun commitPendingSeqNos(pendingSeqNos: MutableMap<String, Long>, commitSeqNo: (String, Long) -> Unit) {
+    pendingSeqNos.forEach { (shard, seqNo) -> commitSeqNo(shard, seqNo) }
+    pendingSeqNos.clear()
+}
+
 fun distributeShards(
     maxFanoutNodes: Int,
     allNodes: List<String>,
