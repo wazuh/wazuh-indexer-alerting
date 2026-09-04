@@ -29,6 +29,7 @@ import org.opensearch.alerting.TriggerService
 import org.opensearch.alerting.action.GetDestinationsAction
 import org.opensearch.alerting.action.GetDestinationsRequest
 import org.opensearch.alerting.action.GetDestinationsResponse
+import org.opensearch.alerting.commitPendingSeqNos
 import org.opensearch.alerting.model.AlertContext
 import org.opensearch.alerting.model.destination.Destination
 import org.opensearch.alerting.model.destination.DestinationContextFactory
@@ -60,9 +61,11 @@ import org.opensearch.alerting.util.destinationmigration.sendNotification
 import org.opensearch.alerting.util.getActionExecutionPolicy
 import org.opensearch.alerting.util.getCancelAfterTimeInterval
 import org.opensearch.alerting.util.isAllowed
+import org.opensearch.alerting.util.isResourcePressureFailure
 import org.opensearch.alerting.util.isTestAction
 import org.opensearch.alerting.util.parseSampleDocTags
 import org.opensearch.alerting.util.printsSampleDocData
+import org.opensearch.alerting.util.rootCauseMessage
 import org.opensearch.alerting.util.use
 import org.opensearch.cluster.routing.Preference
 import org.opensearch.cluster.service.ClusterService
@@ -238,6 +241,9 @@ class TransportDocLevelMonitorFanOutAction
             val inputRunResults = mutableMapOf<String, MutableSet<String>>()
             val docsToQueries = mutableMapOf<String, MutableList<String>>()
             val transformedDocs = mutableListOf<Pair<String, TransformedDocDto>>()
+            // Highest sequence number read per shard for the documents sitting in `transformedDocs`, held
+            // back until the percolate search that evaluates them succeeds.
+            val pendingSeqNos = mutableMapOf<String, Long>()
             val findingIdToDocSource = mutableMapOf<String, MultiGetItemResponse>()
             // Request-scoped so it does not accumulate across monitor executions on the node-lifetime
             // singleton instance (see wazuh/wazuh-indexer#1746). Only read within this executeMonitor call.
@@ -269,7 +275,12 @@ class TransportDocLevelMonitorFanOutAction
                 }
             }
 
-            fetchShardDataAndMaybeExecutePercolateQueries(
+            // Committing a shard's sequence number is what records its documents as covered, so it is left
+            // to the percolate search that evaluates them.
+            val commitSeqNo: (String, Long) -> Unit = { shard, maxSeqNo ->
+                indexExecutionContext!!.updatedLastRunContext[shard] = maxSeqNo
+            }
+            var coverageGap = fetchShardDataAndMaybeExecutePercolateQueries(
                 monitor,
                 endTime,
                 indexExecutionContext!!,
@@ -280,19 +291,21 @@ class TransportDocLevelMonitorFanOutAction
                 concreteIndicesSeenSoFar,
                 ArrayList(fieldsToBeQueried),
                 shardIds.map { it.id },
-                transformedDocs
-            ) { shard, maxSeqNo -> // function passed to update last run context with new max sequence number
-                indexExecutionContext.updatedLastRunContext[shard] = maxSeqNo
-            }
+                transformedDocs,
+                pendingSeqNos,
+                commitSeqNo
+            )
             if (transformedDocs.isNotEmpty()) {
-                performPercolateQueryAndResetCounters(
+                coverageGap += percolateBatchAndCommitProgress(
                     monitor,
                     monitorMetadata,
                     updatedIndexNames,
                     concreteIndicesSeenSoFar,
                     inputRunResults,
                     docsToQueries,
-                    transformedDocs
+                    transformedDocs,
+                    pendingSeqNos,
+                    commitSeqNo
                 )
             }
             monitorResult = monitorResult.copy(inputResults = InputRunResults(listOf(inputRunResults)))
@@ -353,8 +366,20 @@ class TransportDocLevelMonitorFanOutAction
             }
 
             if (!isTempMonitor) {
-                // If any error happened during trigger execution, upsert monitor error alert
-                val errorMessage = constructErrorMessageFromTriggerResults(triggerResults = triggerResults)
+                // If any error happened during trigger execution, or documents went unevaluated, upsert a
+                // monitor error alert. A detection gap has to reach the operator, not just the node log, and a
+                // run that skipped documents must not clear an existing error alert either.
+                val coverageGapMessage = constructCoverageGapMessage(coverageGap, concreteIndicesSeenSoFar)
+                if (coverageGapMessage.isNotEmpty()) {
+                    // Logged in its own right, without a stack trace: each underlying failure is already
+                    // reported where it happened, and this is the one line that states the coverage a run
+                    // lost. The same text goes into the error alert below.
+                    log.error("Monitor ${monitor.id}: $coverageGapMessage")
+                }
+                val errorMessage = listOf(
+                    constructErrorMessageFromTriggerResults(triggerResults = triggerResults),
+                    coverageGapMessage
+                ).filter { it.isNotEmpty() }.joinToString(" | ")
                 log.info(errorMessage)
                 if (errorMessage.isNotEmpty()) {
                     alertService.upsertMonitorErrorAlert(
@@ -787,8 +812,10 @@ class TransportDocLevelMonitorFanOutAction
         fieldsToBeQueried: List<String>,
         shardList: List<Int>,
         transformedDocs: MutableList<Pair<String, TransformedDocDto>>,
+        pendingSeqNos: MutableMap<String, Long>,
         updateLastRunContext: (String, Long) -> Unit
-    ) {
+    ): DetectionCoverageGap {
+        var gap = DetectionCoverageGap()
         for (shardId in shardList) {
             val shard = shardId.toString()
             try {
@@ -824,14 +851,16 @@ class TransportDocLevelMonitorFanOutAction
                             transformedDocs.isNotEmpty() &&
                             shouldPerformPercolateQueryAndFlushInMemoryDocs(transformedDocs.size)
                         ) {
-                            performPercolateQueryAndResetCounters(
+                            gap += percolateBatchAndCommitProgress(
                                 monitor,
                                 monitorMetadata,
                                 monitorInputIndices,
                                 concreteIndices,
                                 inputRunResults,
                                 docsToQueries,
-                                transformedDocs
+                                transformedDocs,
+                                pendingSeqNos,
+                                updateLastRunContext
                             )
                         }
                         log.info(
@@ -868,26 +897,30 @@ class TransportDocLevelMonitorFanOutAction
 
                     transformedDocs.addAll(newDocs)
 
+                    // Move to next chunk - use the last document's sequence number
+                    currentSeqNo = hits.hits.last().seqNo
+                    // Record how far this shard has been read, but hold the sequence number back: it is only
+                    // committed once a percolate search has actually evaluated these documents. Committing it
+                    // here is what allowed a refused search to skip documents for good.
+                    pendingSeqNos[shard] = currentSeqNo
+
                     if (
                         transformedDocs.isNotEmpty() &&
                         shouldPerformPercolateQueryAndFlushInMemoryDocs(transformedDocs.size)
                     ) {
-                        performPercolateQueryAndResetCounters(
+                        gap += percolateBatchAndCommitProgress(
                             monitor,
                             monitorMetadata,
                             monitorInputIndices,
                             concreteIndices,
                             inputRunResults,
                             docsToQueries,
-                            transformedDocs
+                            transformedDocs,
+                            pendingSeqNos,
+                            updateLastRunContext
                         )
                     }
                     docTransformTimeTakenStat += System.currentTimeMillis() - startTime
-
-                    // Move to next chunk - use the last document's sequence number
-                    currentSeqNo = hits.hits.last().seqNo
-                    // update last seen sequence number after every set of seen docs
-                    updateLastRunContext(shard, currentSeqNo)
                 }
             } catch (e: Exception) {
                 val message = "Monitor ${monitor.id} :" +
@@ -896,6 +929,13 @@ class TransportDocLevelMonitorFanOutAction
                 if (e is QueryShardException && e.message?.contains("No field mapping can be found") == true) {
                     // Expected during WCS dynamic mapping bootstrap; resolves itself as data arrives.
                     log.debug(message, e)
+                } else if (isResourcePressureFailure(e)) {
+                    // Nothing is lost here: the shard was not read to the end, but its sequence number has
+                    // only been advanced as far as the documents that percolated, so the next run resumes
+                    // where this one stopped. It is therefore not a coverage gap, just a slower run -- hence a
+                    // warning rather than an error alert. Logged without a stack trace: the message already
+                    // names the shard and the reason.
+                    log.warn("$message Reading of this shard resumes on the next run.")
                 } else {
                     log.error(message, e)
                 }
@@ -907,53 +947,122 @@ class TransportDocLevelMonitorFanOutAction
                 transformedDocs.isNotEmpty() &&
                 shouldPerformPercolateQueryAndFlushInMemoryDocs(transformedDocs.size)
             ) {
-                performPercolateQueryAndResetCounters(
+                gap += percolateBatchAndCommitProgress(
                     monitor,
                     monitorMetadata,
                     monitorInputIndices,
                     concreteIndices,
                     inputRunResults,
                     docsToQueries,
-                    transformedDocs
+                    transformedDocs,
+                    pendingSeqNos,
+                    updateLastRunContext
                 )
             }
         }
+        return gap
     }
 
-    private suspend fun performPercolateQueryAndResetCounters(
+    /**
+     * Percolates the batch accumulated in memory and commits the shard sequence numbers held in
+     * [pendingSeqNos] only once the documents behind them have actually been evaluated.
+     *
+     * A batch is evaluated by a single percolate search, so coverage is all-or-nothing: on success every
+     * pending sequence number is committed, and on failure none of them are.
+     *
+     * When the cluster refuses the search because it is short of resources -- `SearchBackpressureService`
+     * cancelling it in enforced mode is the case seen in practice -- the sequence numbers stay pending, so
+     * the next run reads those documents again instead of stepping over them. That is the whole fix: the
+     * batch used to be discarded while the shard had already been advanced past it.
+     *
+     * Any other failure is treated as a defect rather than a shortage, and the batch is given up on: its
+     * sequence numbers are committed so the monitor keeps up with new documents instead of stalling on the
+     * same batch on every run. That is a real gap, so it is counted and reported.
+     *
+     * Failures are logged without a stack trace -- the message carries the monitor, the index, the document
+     * count and the reason, which is what an operator needs -- and the count is also reported through the
+     * monitor's error alert by the caller.
+     */
+    private suspend fun percolateBatchAndCommitProgress(
         monitor: Monitor,
         monitorMetadata: MonitorMetadata,
         monitorInputIndices: List<String>,
         concreteIndices: List<String>,
         inputRunResults: MutableMap<String, MutableSet<String>>,
         docsToQueries: MutableMap<String, MutableList<String>>,
-        transformedDocs: MutableList<Pair<String, TransformedDocDto>>
-    ) {
+        transformedDocs: MutableList<Pair<String, TransformedDocDto>>,
+        pendingSeqNos: MutableMap<String, Long>,
+        commitSeqNo: (String, Long) -> Unit
+    ): DetectionCoverageGap {
+        val batchSize = transformedDocs.size
         try {
-            val percolateQueryResponseHits = runPercolateQueryOnTransformedDocs(
+            percolateDocsAndCollectHits(
                 transformedDocs,
                 monitor,
                 monitorMetadata,
-                concreteIndices,
                 monitorInputIndices,
+                concreteIndices,
+                inputRunResults,
+                docsToQueries
             )
-
-            percolateQueryResponseHits.forEach { hit ->
-                var id = hit.id
-                concreteIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
-                monitorInputIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
-                val docIndices = hit.field("_percolator_document_slot").values.map { it.toString().toInt() }
-                docIndices.forEach { idx ->
-                    val docIndex = "${transformedDocs[idx].first}|${transformedDocs[idx].second.concreteIndexName}"
-                    inputRunResults.getOrPut(id) { mutableSetOf() }.add(docIndex)
-                    docsToQueries.getOrPut(docIndex) { mutableListOf() }.add(id)
-                }
+            commitPendingSeqNos(pendingSeqNos, commitSeqNo)
+            return DetectionCoverageGap()
+        } catch (e: Exception) {
+            if (isResourcePressureFailure(e)) {
+                log.error(
+                    "Monitor ${monitor.id}: percolate search for $batchSize document(s) of " +
+                        "[${concreteIndices.joinToString()}] was refused for lack of resources " +
+                        "(${rootCauseMessage(e)}). Their sequence numbers stay uncommitted, " +
+                        "so the next run evaluates them again."
+                )
+                return DetectionCoverageGap(deferredDocs = batchSize)
             }
-            totalDocsQueriedStat += transformedDocs.size.toLong()
+            log.error(
+                "Monitor ${monitor.id}: percolate search for $batchSize document(s) of " +
+                    "[${concreteIndices.joinToString()}] failed (${rootCauseMessage(e)}). " +
+                    "Those documents will not be evaluated by this monitor's queries."
+            )
+            commitPendingSeqNos(pendingSeqNos, commitSeqNo)
+            return DetectionCoverageGap(abandonedDocs = batchSize)
         } finally {
+            // Sequence numbers still pending here were not evaluated, so they stay uncommitted and the
+            // documents behind them are read again.
+            pendingSeqNos.clear()
             transformedDocs.clear()
             docsSizeOfBatchInBytes = 0
         }
+    }
+
+    /** Runs the percolate query for [docs] and folds the queries it matched into the run results. */
+    private suspend fun percolateDocsAndCollectHits(
+        docs: MutableList<Pair<String, TransformedDocDto>>,
+        monitor: Monitor,
+        monitorMetadata: MonitorMetadata,
+        monitorInputIndices: List<String>,
+        concreteIndices: List<String>,
+        inputRunResults: MutableMap<String, MutableSet<String>>,
+        docsToQueries: MutableMap<String, MutableList<String>>
+    ) {
+        val percolateQueryResponseHits = runPercolateQueryOnTransformedDocs(
+            docs,
+            monitor,
+            monitorMetadata,
+            concreteIndices,
+            monitorInputIndices,
+        )
+
+        percolateQueryResponseHits.forEach { hit ->
+            var id = hit.id
+            concreteIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
+            monitorInputIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
+            val docIndices = hit.field("_percolator_document_slot").values.map { it.toString().toInt() }
+            docIndices.forEach { idx ->
+                val docIndex = "${docs[idx].first}|${docs[idx].second.concreteIndexName}"
+                inputRunResults.getOrPut(id) { mutableSetOf() }.add(docIndex)
+                docsToQueries.getOrPut(docIndex) { mutableListOf() }.add(id)
+            }
+        }
+        totalDocsQueriedStat += docs.size.toLong()
     }
 
     private suspend fun getMaxSeqNoForShard(
@@ -1413,6 +1522,22 @@ class TransportDocLevelMonitorFanOutAction
         }
     }
 
+    /**
+     * Describes the documents this fan-out could not evaluate, for the monitor's error alert. Empty when the
+     * whole batch was evaluated.
+     */
+    private fun constructCoverageGapMessage(gap: DetectionCoverageGap, concreteIndices: List<String>): String {
+        if (gap.isEmpty()) return ""
+        val parts = mutableListOf<String>()
+        if (gap.abandonedDocs > 0) {
+            parts.add("${gap.abandonedDocs} document(s) abandoned and never evaluated")
+        }
+        if (gap.deferredDocs > 0) {
+            parts.add("${gap.deferredDocs} document(s) left to be evaluated on the next run")
+        }
+        return "Detection coverage gap on [${concreteIndices.joinToString()}]: ${parts.joinToString(", ")}."
+    }
+
     private fun constructErrorMessageFromTriggerResults(
         triggerResults: MutableMap<String, DocumentLevelTriggerRunResult>? = null
     ): String {
@@ -1429,6 +1554,24 @@ class TransportDocLevelMonitorFanOutAction
             }
         }
         return errorMessage
+    }
+
+    /**
+     * Documents a fan-out read but did not evaluate, separated by whether they will be seen again.
+     *
+     * [deferredDocs] are re-read on the next run because their sequence numbers were never committed;
+     * [abandonedDocs] were stepped over and will not be evaluated by this monitor at all.
+     *
+     * A shard whose *fetch* was cancelled is not counted: nothing was read, its sequence number did not move,
+     * and the next run resumes where this one stopped, so there is no gap to report.
+     */
+    data class DetectionCoverageGap(val deferredDocs: Int = 0, val abandonedDocs: Int = 0) {
+        fun isEmpty(): Boolean = deferredDocs == 0 && abandonedDocs == 0
+
+        operator fun plus(other: DetectionCoverageGap): DetectionCoverageGap = DetectionCoverageGap(
+            deferredDocs + other.deferredDocs,
+            abandonedDocs + other.abandonedDocs
+        )
     }
 
     /**

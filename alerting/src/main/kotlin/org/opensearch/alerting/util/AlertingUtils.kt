@@ -6,6 +6,7 @@
 package org.opensearch.alerting.util
 
 import org.apache.logging.log4j.LogManager
+import org.opensearch.action.search.SearchPhaseExecutionException
 import org.opensearch.alerting.AlertService
 import org.opensearch.alerting.MonitorRunnerService
 import org.opensearch.alerting.model.AlertContext
@@ -27,6 +28,9 @@ import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
 import org.opensearch.commons.alerting.model.action.ActionExecutionScope
 import org.opensearch.commons.alerting.util.isBucketLevelMonitor
 import org.opensearch.commons.alerting.util.isMonitorOfStandardType
+import org.opensearch.core.common.breaker.CircuitBreakingException
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException
+import org.opensearch.core.tasks.TaskCancelledException
 import org.opensearch.node.NodeClosedException
 import org.opensearch.script.Script
 import org.opensearch.transport.NodeNotConnectedException
@@ -328,6 +332,73 @@ fun isNodeUnavailableFailure(e: Exception): Boolean {
         }
         val message = cause.message
         if (message != null && NODE_UNAVAILABLE_EXCEPTION_NAMES.any { message.startsWith("$it:") }) {
+            return true
+        }
+        val next = cause.cause
+        cause = if (next === cause) null else next
+    }
+    return false
+}
+
+/**
+ * Class names recorded by `AlertingException.wrap()` for the resource-pressure failures below, for the
+ * same reason [NODE_UNAVAILABLE_EXCEPTION_NAMES] exists: the original type does not survive flattening.
+ */
+private val RESOURCE_PRESSURE_EXCEPTION_NAMES = setOf(
+    TaskCancelledException::class.java.name,
+    CircuitBreakingException::class.java.name,
+    OpenSearchRejectedExecutionException::class.java.name
+)
+
+/**
+ * The deepest cause of [e] rendered as `SimpleName: message`.
+ *
+ * Lets a failure be reported on one line, naming the real reason without attaching a stack trace. For a
+ * search cancelled by backpressure this reaches the `TaskCancelledException` and its reason, because
+ * `SearchPhaseExecutionException` wires its first shard failure's cause into its own cause chain.
+ */
+fun rootCauseMessage(e: Throwable): String {
+    var cause: Throwable = e
+    var depth = 0
+    while (depth++ < MAX_CAUSE_CHAIN_DEPTH) {
+        val next = cause.cause ?: break
+        if (next === cause) break
+        cause = next
+    }
+    return "${cause.javaClass.simpleName}: ${cause.message}"
+}
+
+/**
+ * Returns true when [e], or any cause it wraps, means the cluster refused to finish the work because it
+ * was short of resources -- `SearchBackpressureService` cancelling the task in enforced mode, a tripped
+ * circuit breaker, or a rejected execution -- rather than a defect in the request itself.
+ *
+ * Such a failure says nothing about whether the work is valid, only that there was no headroom for it at
+ * that size. The caller can therefore retry it in smaller pieces, or leave it for the next run, instead
+ * of discarding it.
+ *
+ * A cancelled search reaches the client as a `SearchPhaseExecutionException` ("all shards failed") whose
+ * per-shard causes carry the real reason. Only the *first* shard failure is wired into the exception's own
+ * cause chain, so every shard failure is inspected too: the cancelled shard need not be the first one.
+ */
+fun isResourcePressureFailure(e: Throwable): Boolean {
+    var cause: Throwable? = e
+    var depth = 0
+    while (cause != null && depth++ < MAX_CAUSE_CHAIN_DEPTH) {
+        if (cause is TaskCancelledException ||
+            cause is CircuitBreakingException ||
+            cause is OpenSearchRejectedExecutionException
+        ) {
+            return true
+        }
+        val message = cause.message
+        if (message != null && RESOURCE_PRESSURE_EXCEPTION_NAMES.any { message.startsWith("$it:") }) {
+            return true
+        }
+        val current = cause
+        if (current is SearchPhaseExecutionException &&
+            current.shardFailures().any { failure -> failure.cause?.let { isResourcePressureFailure(it) } == true }
+        ) {
             return true
         }
         val next = cause.cause

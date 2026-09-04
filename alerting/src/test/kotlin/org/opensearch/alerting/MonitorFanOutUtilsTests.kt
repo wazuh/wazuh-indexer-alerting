@@ -131,4 +131,32 @@ class MonitorFanOutUtilsTests : OpenSearchTestCase() {
         }
         assertEquals(expectedTotalShardCount, shardCount)
     }
+
+    fun `test evaluating a batch commits every held-back sequence number`() {
+        // Five 10000-document chunks were read from shard 0 before the batch was percolated.
+        val pending = mutableMapOf("0" to 49999L)
+        val committed = mutableMapOf<String, Long>()
+
+        commitPendingSeqNos(pending) { shard, seqNo -> committed[shard] = seqNo }
+
+        assertEquals(mapOf("0" to 49999L), committed)
+        assertTrue("Committed sequence numbers must not be committed twice", pending.isEmpty())
+    }
+
+    fun `test every shard read into the batch is committed`() {
+        // One batch can span several shards of an index; all of them are covered by the same search.
+        val pending = mutableMapOf("0" to 9999L, "1" to 4999L, "2" to 7999L)
+        val committed = mutableMapOf<String, Long>()
+
+        commitPendingSeqNos(pending) { shard, seqNo -> committed[shard] = seqNo }
+
+        assertEquals(mapOf("0" to 9999L, "1" to 4999L, "2" to 7999L), committed)
+        assertTrue(pending.isEmpty())
+    }
+
+    fun `test committing an empty batch does nothing`() {
+        val pending = mutableMapOf<String, Long>()
+        commitPendingSeqNos(pending) { _, _ -> fail("there was nothing to commit") }
+        assertTrue(pending.isEmpty())
+    }
 }
