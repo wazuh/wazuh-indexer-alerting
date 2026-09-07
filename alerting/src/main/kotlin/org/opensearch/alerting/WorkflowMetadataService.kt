@@ -20,6 +20,7 @@ import org.opensearch.action.index.IndexResponse
 import org.opensearch.action.support.WriteRequest
 import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.settings.AlertingSettings
+import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
 import org.opensearch.common.unit.TimeValue
@@ -104,7 +105,12 @@ object WorkflowMetadataService :
                 )
                 return upsertWorkflowMetadata(metadata, true)
             }
-            log.error("Error saving metadata", e)
+            if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away: the run is abandoned, not failed.
+                log.debug("Skipped saving metadata ${metadata.id} for workflow ${metadata.workflowId}: node is closing", e)
+            } else {
+                log.error("Error saving metadata", e)
+            }
             throw AlertingException.wrap(e)
         }
     }

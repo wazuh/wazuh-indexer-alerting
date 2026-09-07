@@ -18,6 +18,7 @@ import org.opensearch.alerting.MonitorRunnerService
 import org.opensearch.alerting.action.ExecuteWorkflowAction
 import org.opensearch.alerting.action.ExecuteWorkflowRequest
 import org.opensearch.alerting.action.ExecuteWorkflowResponse
+import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.alerting.util.use
 import org.opensearch.common.inject.Inject
 import org.opensearch.common.xcontent.LoggingDeprecationHandler
@@ -69,7 +70,7 @@ class TransportExecuteWorkflowAction @Inject constructor(
                     }
                     try {
                         log.info(
-                            "Executing workflow from API - id: ${workflow.id}, periodStart: $periodStart, periodEnd: $periodEnd, " +
+                            "Executing workflow - id: ${workflow.id}, periodStart: $periodStart, periodEnd: $periodEnd, " +
                                 "dryrun: ${execWorkflowRequest.dryrun}"
                         )
                         val workflowRunResult =
@@ -88,7 +89,13 @@ class TransportExecuteWorkflowAction @Inject constructor(
                             )
                         })
                     } catch (e: Exception) {
-                        log.error("Unexpected error running workflow", e)
+                        if (isNodeUnavailableFailure(e)) {
+                            // The node is shutting down or a peer has gone away: the run is
+                            // abandoned and retried on the next schedule, not failed.
+                            log.debug("Workflow ${workflow.id} did not complete: node is closing", e)
+                        } else {
+                            log.error("Error running workflow ${workflow.id}", e)
+                        }
                         withContext(Dispatchers.IO) {
                             actionListener.onFailure(AlertingException.wrap(e))
                         }

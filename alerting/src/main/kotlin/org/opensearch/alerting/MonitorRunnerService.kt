@@ -54,6 +54,7 @@ import org.opensearch.alerting.util.DocLevelMonitorQueries
 import org.opensearch.alerting.util.IndexUtils
 import org.opensearch.alerting.util.isActiveResponseMonitor
 import org.opensearch.alerting.util.isDocLevelMonitor
+import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.alerting.workflow.CompositeWorkflowRunner
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver
 import org.opensearch.cluster.service.ClusterService
@@ -372,7 +373,13 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
                             )
                         }
                     } catch (e: Exception) {
-                        logger.error("Workflow run failed for workflow with id ${job.id}", e)
+                        if (isNodeUnavailableFailure(e)) {
+                            // The node is shutting down or a peer has gone away: the run is
+                            // abandoned and retried on the next schedule, not failed.
+                            logger.debug("Workflow run for workflow with id ${job.id} did not complete: node is closing", e)
+                        } else {
+                            logger.error("Workflow run failed for workflow with id ${job.id}", e)
+                        }
                     } finally {
                         workflowLock?.let { releaseJobLock(it) }
                     }
