@@ -17,6 +17,7 @@ import org.opensearch.alerting.WorkflowMetadataService
 import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.script.ChainedAlertTriggerExecutionContext
 import org.opensearch.alerting.util.isDocLevelMonitor
+import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.alerting.util.isQueryLevelMonitor
 import org.opensearch.cluster.routing.Preference
 import org.opensearch.common.xcontent.LoggingDeprecationHandler

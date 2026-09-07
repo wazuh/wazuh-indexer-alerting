@@ -11,6 +11,7 @@ import org.opensearch.Version
 import org.opensearch.action.ActionListenerResponseHandler
 import org.opensearch.action.support.GroupedActionListener
 import org.opensearch.alerting.util.IndexUtils
+import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.cluster.metadata.IndexMetadata
 import org.opensearch.cluster.node.DiscoveryNode
 import org.opensearch.cluster.routing.ShardRouting
@@ -80,6 +81,10 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                     "Monitor [$id] can't process index [$monitor.dataSources] due to field mapping limit"
                 logger.error("Exception: ${unwrappedException.message}")
                 monitorResult = monitorResult.copy(error = AlertingException(errorMessage, RestStatus.INTERNAL_SERVER_ERROR, e))
+            } else if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away: the run is abandoned, not failed.
+                logger.debug("Skipped setting up alerts and findings indices for monitor $id: node is closing", e)
+                monitorResult = monitorResult.copy(error = AlertingException.wrap(e))
             } else {
                 logger.error("Error setting up alerts and findings indices for monitor: $id", e)
                 monitorResult = monitorResult.copy(error = AlertingException.wrap(e))

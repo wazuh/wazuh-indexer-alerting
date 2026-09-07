@@ -6,6 +6,8 @@
 package org.opensearch.alerting.util
 
 import org.mockito.Mockito.mock
+import org.opensearch.OpenSearchException
+import org.opensearch.Version
 import org.opensearch.alerting.AlertService
 import org.opensearch.alerting.MonitorRunnerService
 import org.opensearch.alerting.model.AlertContext
@@ -17,10 +19,16 @@ import org.opensearch.alerting.randomQueryLevelTrigger
 import org.opensearch.alerting.randomTemplateScript
 import org.opensearch.alerting.script.BucketLevelTriggerExecutionContext
 import org.opensearch.alerting.script.DocumentLevelTriggerExecutionContext
+import org.opensearch.cluster.node.DiscoveryNode
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.unit.TimeValue
+import org.opensearch.commons.alerting.util.AlertingException
+import org.opensearch.node.NodeClosedException
 import org.opensearch.test.OpenSearchTestCase
+import org.opensearch.transport.NodeNotConnectedException
+import org.opensearch.transport.RemoteTransportException
 import org.opensearch.transport.client.Client
+import java.io.IOException
 class AlertingUtilsTests : OpenSearchTestCase() {
     fun `test parseSampleDocTags only returns expected tags`() {
         val expectedDocSourceTags = (0..3).map { "field$it" }
@@ -255,5 +263,55 @@ class AlertingUtilsTests : OpenSearchTestCase() {
 
         assertTrue("Expected 'message' in flatten paths", flattenPaths.containsKey("message"))
         assertTrue("Expected 'dll.name' in flatten paths", flattenPaths.containsKey("dll.name"))
+    }
+
+    private fun node() = DiscoveryNode("node", buildNewFakeTransportAddress(), Version.CURRENT)
+
+    fun `test node closed exception is a node unavailable failure`() {
+        assertTrue(isNodeUnavailableFailure(NodeClosedException(node())))
+    }
+
+    fun `test node not connected exception is a node unavailable failure`() {
+        assertTrue(isNodeUnavailableFailure(NodeNotConnectedException(node(), "not connected")))
+    }
+
+    fun `test wrapped node closed exception is a node unavailable failure`() {
+        // A shutdown seen through a transport hop arrives wrapped; the cause must still be recognised.
+        val wrapped = RemoteTransportException("indices:admin/create", NodeClosedException(node()))
+        assertTrue(isNodeUnavailableFailure(wrapped))
+    }
+
+    fun `test genuine failure is not a node unavailable failure`() {
+        // An alert index that cannot be read is a real error and must keep error-level logging.
+        assertFalse(isNodeUnavailableFailure(OpenSearchException("all shards failed")))
+        assertFalse(isNodeUnavailableFailure(IllegalStateException("boom")))
+        assertFalse(isNodeUnavailableFailure(IOException("disk gone")))
+    }
+
+    fun `test wrapped genuine failure is not a node unavailable failure`() {
+        val wrapped = RemoteTransportException("indices:data/read/search", IllegalStateException("boom"))
+        assertFalse(isNodeUnavailableFailure(wrapped))
+    }
+
+    fun `test node closed exception already converted to an AlertingException is a node unavailable failure`() {
+        // AlertIndices.createIndex() throws AlertingException.wrap(t), so the callers above it never
+        // see the NodeClosedException itself: wrap() flattens it to Exception("<class name>: <msg>")
+        // and AlertingException is not an OpenSearchWrapperException, so unwrapCause() stops there.
+        val converted = AlertingException.wrap(NodeClosedException(node())) as Exception
+
+        assertTrue(isNodeUnavailableFailure(converted))
+    }
+
+    fun `test converted node closed exception is recognised through a transport hop`() {
+        val converted = AlertingException.wrap(NodeClosedException(node())) as Exception
+        val wrapped = RemoteTransportException("indices:admin/create", converted)
+
+        assertTrue(isNodeUnavailableFailure(wrapped))
+    }
+
+    fun `test converted genuine failure is not a node unavailable failure`() {
+        val converted = AlertingException.wrap(IllegalStateException("boom")) as Exception
+
+        assertFalse(isNodeUnavailableFailure(converted))
     }
 }
