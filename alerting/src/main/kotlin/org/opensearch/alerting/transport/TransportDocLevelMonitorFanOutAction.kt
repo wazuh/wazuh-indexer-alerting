@@ -61,8 +61,8 @@ import org.opensearch.alerting.util.destinationmigration.sendNotification
 import org.opensearch.alerting.util.getActionExecutionPolicy
 import org.opensearch.alerting.util.getCancelAfterTimeInterval
 import org.opensearch.alerting.util.isAllowed
-import org.opensearch.alerting.util.isResourcePressureFailure
 import org.opensearch.alerting.util.isTestAction
+import org.opensearch.alerting.util.isTransientFailure
 import org.opensearch.alerting.util.parseSampleDocTags
 import org.opensearch.alerting.util.printsSampleDocData
 import org.opensearch.alerting.util.rootCauseMessage
@@ -908,7 +908,7 @@ class TransportDocLevelMonitorFanOutAction
                         transformedDocs.isNotEmpty() &&
                         shouldPerformPercolateQueryAndFlushInMemoryDocs(transformedDocs.size)
                     ) {
-                        gap += percolateBatchAndCommitProgress(
+                        val batchGap = percolateBatchAndCommitProgress(
                             monitor,
                             monitorMetadata,
                             monitorInputIndices,
@@ -919,6 +919,20 @@ class TransportDocLevelMonitorFanOutAction
                             pendingSeqNos,
                             updateLastRunContext
                         )
+                        gap += batchGap
+                        if (batchGap.deferredDocs > 0) {
+                            // Stop reading this shard. `updatedLastRunContext` holds one high-water mark per
+                            // shard, so it cannot express "evaluated up to here, except for a hole". Carrying
+                            // on would let the next successful batch commit a higher sequence number and step
+                            // straight over the documents this one could not evaluate.
+                            log.warn(
+                                "Monitor ${monitor.id}: stopping the read of shard " +
+                                    "[${indexExecutionCtx.concreteIndexName}][$shard] at sequence number " +
+                                    "$currentSeqNo so the documents left unevaluated are not skipped. " +
+                                    "The next run resumes from the last evaluated batch."
+                            )
+                            break
+                        }
                     }
                     docTransformTimeTakenStat += System.currentTimeMillis() - startTime
                 }
@@ -926,10 +940,16 @@ class TransportDocLevelMonitorFanOutAction
                 val message = "Monitor ${monitor.id} :" +
                     "Failed to run fetch data from shard [$shard] of index [${indexExecutionCtx.concreteIndexName}]. " +
                     "Error: ${e.message}"
+                if (e is IndexClosedException) {
+                    // A closed source index stops the whole run: re-thrown below, so it must not be described
+                    // as resuming on the next run even though it is transient.
+                    log.error(message, e)
+                    throw e
+                }
                 if (e is QueryShardException && e.message?.contains("No field mapping can be found") == true) {
                     // Expected during WCS dynamic mapping bootstrap; resolves itself as data arrives.
                     log.debug(message, e)
-                } else if (isResourcePressureFailure(e)) {
+                } else if (isTransientFailure(e)) {
                     // Nothing is lost here: the shard was not read to the end, but its sequence number has
                     // only been advanced as far as the documents that percolated, so the next run resumes
                     // where this one stopped. It is therefore not a coverage gap, just a slower run -- hence a
@@ -938,9 +958,6 @@ class TransportDocLevelMonitorFanOutAction
                     log.warn("$message Reading of this shard resumes on the next run.")
                 } else {
                     log.error(message, e)
-                }
-                if (e is IndexClosedException) {
-                    throw e
                 }
             }
             if (
@@ -1008,10 +1025,10 @@ class TransportDocLevelMonitorFanOutAction
             commitPendingSeqNos(pendingSeqNos, commitSeqNo)
             return DetectionCoverageGap()
         } catch (e: Exception) {
-            if (isResourcePressureFailure(e)) {
+            if (isTransientFailure(e)) {
                 log.error(
                     "Monitor ${monitor.id}: percolate search for $batchSize document(s) of " +
-                        "[${concreteIndices.joinToString()}] was refused for lack of resources " +
+                        "[${concreteIndices.joinToString()}] could not be completed " +
                         "(${rootCauseMessage(e)}). Their sequence numbers stay uncommitted, " +
                         "so the next run evaluates them again."
                 )

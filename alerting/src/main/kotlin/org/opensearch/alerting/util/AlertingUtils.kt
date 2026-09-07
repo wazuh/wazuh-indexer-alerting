@@ -31,6 +31,8 @@ import org.opensearch.commons.alerting.util.isMonitorOfStandardType
 import org.opensearch.core.common.breaker.CircuitBreakingException
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException
 import org.opensearch.core.tasks.TaskCancelledException
+import org.opensearch.index.IndexNotFoundException
+import org.opensearch.indices.IndexClosedException
 import org.opensearch.node.NodeClosedException
 import org.opensearch.script.Script
 import org.opensearch.transport.NodeNotConnectedException
@@ -341,13 +343,15 @@ fun isNodeUnavailableFailure(e: Exception): Boolean {
 }
 
 /**
- * Class names recorded by `AlertingException.wrap()` for the resource-pressure failures below, for the
- * same reason [NODE_UNAVAILABLE_EXCEPTION_NAMES] exists: the original type does not survive flattening.
+ * Class names recorded by `AlertingException.wrap()` for the transient failures below, for the same reason
+ * [NODE_UNAVAILABLE_EXCEPTION_NAMES] exists: the original type does not survive flattening.
  */
-private val RESOURCE_PRESSURE_EXCEPTION_NAMES = setOf(
+private val TRANSIENT_EXCEPTION_NAMES = setOf(
     TaskCancelledException::class.java.name,
     CircuitBreakingException::class.java.name,
-    OpenSearchRejectedExecutionException::class.java.name
+    OpenSearchRejectedExecutionException::class.java.name,
+    IndexClosedException::class.java.name,
+    IndexNotFoundException::class.java.name
 )
 
 /**
@@ -369,35 +373,40 @@ fun rootCauseMessage(e: Throwable): String {
 }
 
 /**
- * Returns true when [e], or any cause it wraps, means the cluster refused to finish the work because it
- * was short of resources -- `SearchBackpressureService` cancelling the task in enforced mode, a tripped
- * circuit breaker, or a rejected execution -- rather than a defect in the request itself.
+ * Returns true when [e], or any cause it wraps, describes a condition that may simply not be there next
+ * time, rather than a defect in the request itself. Two families qualify:
  *
- * Such a failure says nothing about whether the work is valid, only that there was no headroom for it at
- * that size. The caller can therefore retry it in smaller pieces, or leave it for the next run, instead
- * of discarding it.
+ * - the cluster refused to finish the work for want of resources -- `SearchBackpressureService` cancelling
+ *   the task in enforced mode, a tripped circuit breaker, a rejected execution;
+ * - an index the work needs is closed or missing, which an operator can undo by reopening or recreating it.
+ *
+ * Neither says the work is invalid, so the caller can leave it for the next run instead of discarding it. A
+ * defect that would fail identically forever -- a mapping conflict, an unparseable query -- must not be
+ * classified here, or the work would be retried indefinitely and never make progress.
  *
  * A cancelled search reaches the client as a `SearchPhaseExecutionException` ("all shards failed") whose
  * per-shard causes carry the real reason. Only the *first* shard failure is wired into the exception's own
  * cause chain, so every shard failure is inspected too: the cancelled shard need not be the first one.
  */
-fun isResourcePressureFailure(e: Throwable): Boolean {
+fun isTransientFailure(e: Throwable): Boolean {
     var cause: Throwable? = e
     var depth = 0
     while (cause != null && depth++ < MAX_CAUSE_CHAIN_DEPTH) {
         if (cause is TaskCancelledException ||
             cause is CircuitBreakingException ||
-            cause is OpenSearchRejectedExecutionException
+            cause is OpenSearchRejectedExecutionException ||
+            cause is IndexClosedException ||
+            cause is IndexNotFoundException
         ) {
             return true
         }
         val message = cause.message
-        if (message != null && RESOURCE_PRESSURE_EXCEPTION_NAMES.any { message.startsWith("$it:") }) {
+        if (message != null && TRANSIENT_EXCEPTION_NAMES.any { message.startsWith("$it:") }) {
             return true
         }
         val current = cause
         if (current is SearchPhaseExecutionException &&
-            current.shardFailures().any { failure -> failure.cause?.let { isResourcePressureFailure(it) } == true }
+            current.shardFailures().any { failure -> failure.cause?.let { isTransientFailure(it) } == true }
         ) {
             return true
         }
