@@ -64,7 +64,15 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         const val NESTED = "nested"
         const val TYPE = "type"
         const val INDEX_PATTERN_SUFFIX = "-000001"
-        const val QUERY_INDEX_BASE_FIELDS_COUNT = 8 // 3 fields we defined and 5 builtin additional metadata fields
+        const val QUERY_INDEX_BASE_FIELDS_COUNT = 9 // 4 fields we defined and 5 builtin additional metadata fields
+
+        /**
+         * Field mapped in the query index but never present in a percolated document.
+         *
+         * Clauses over a field that the source index does not map are pointed at it so that the
+         * percolator can parse them (see [transformAbsentFieldQuery]).
+         */
+        const val ABSENT_FIELD_SENTINEL = "wazuh_absent_field_sentinel"
         @JvmStatic
         fun docLevelQueriesMappings(): String {
             return DocLevelMonitorQueries::class.java.classLoader.getResource("mappings/doc-level-queries.json").readText()
@@ -359,6 +367,10 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     }
                 }
             }
+            // Keep the sentinel mapped on pre-existing query indices too: the base mappings only
+            // apply to a query index created from scratch.
+            updatedProperties[ABSENT_FIELD_SENTINEL] = mapOf(TYPE to "keyword")
+
             // Updates mappings of concrete queryIndex. This can rollover queryIndex if field mapping limit is reached.
             val (updateMappingResponse, concreteQueryIndex) = updateQueryIndexMappings(
                 monitor,
@@ -436,6 +448,8 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             }
         }
 
+        val mappedPaths = flattenPaths.mapTo(mutableSetOf()) { it.first }.apply { addAll(conflictingPaths) }
+
         newQueries.forEach {
             var query = it.query
             flattenPaths.forEach { fieldPath ->
@@ -444,6 +458,7 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     query = query.replace("${fieldPath.first}:", "${fieldPath.first}_${sourceIndex}_$monitorId:")
                 }
             }
+            query = transformAbsentFieldQuery(query, it.queryFieldNames.filterNot { f -> mappedPaths.contains(f) })
             val indexRequest = IndexRequest(concreteQueryIndex)
                 .id(it.id + "_$monitorId")
                 .source(
@@ -495,6 +510,36 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     segment
                 }
             }
+    }
+
+    /**
+     * Points clauses over fields that the source index does not map at [ABSENT_FIELD_SENTINEL].
+     *
+     * The percolator refuses to parse a query that references an unmapped field ("No field mapping
+     * can be found for the field with name [...]"), so a single such clause silently drops the whole
+     * rule and it never produces a finding. That is unrecoverable for a rule whose purpose is to
+     * detect a *missing* field: the field never reaches a document, so the source index never maps
+     * it, so the rule can never be indexed (wazuh/wazuh-indexer-plugins#1518).
+     *
+     * A field absent from the mapping is absent from every document of the index -- event indices are
+     * `strict_allow_templates`, so a field only gets mapped when a document brings it. Pointing the
+     * clause at a field that is mapped in the query index but never present in a percolated document
+     * preserves that meaning: `<absent field>: <anything>` and `_exists_:<absent field>` are false,
+     * `NOT _exists_:<absent field>` is true. Once documents do bring the field, the source index maps
+     * it and the [flattenPaths] rename above takes over -- queries are rebuilt on every monitor run.
+     */
+    internal fun transformAbsentFieldQuery(query: String, absentFields: Collection<String>): String {
+        if (absentFields.isEmpty()) return query
+        // Read `_exists_: field` as a single token, the same way transformExistsQuery does.
+        var transformed = query.replace("_exists_: ", "_exists_:")
+        absentFields.forEach { field ->
+            val name = Regex.escape(field)
+            // Only whole field names in a field position, so that neither the `name` of `user.name`
+            // nor a `user.name` inside a matched value is rewritten.
+            transformed = transformed.replace(Regex("(?<![\\w.])$name(?=:)"), ABSENT_FIELD_SENTINEL)
+            transformed = transformed.replace(Regex("(?<=_exists_:)$name(?![\\w.])"), ABSENT_FIELD_SENTINEL)
+        }
+        return transformed
     }
 
     private suspend fun updateQueryIndexMappings(
