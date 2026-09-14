@@ -6,6 +6,7 @@
 package org.opensearch.alerting.util
 
 import org.apache.logging.log4j.LogManager
+import org.opensearch.action.search.SearchPhaseExecutionException
 import org.opensearch.alerting.AlertService
 import org.opensearch.alerting.MonitorRunnerService
 import org.opensearch.alerting.model.AlertContext
@@ -27,6 +28,11 @@ import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
 import org.opensearch.commons.alerting.model.action.ActionExecutionScope
 import org.opensearch.commons.alerting.util.isBucketLevelMonitor
 import org.opensearch.commons.alerting.util.isMonitorOfStandardType
+import org.opensearch.core.common.breaker.CircuitBreakingException
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException
+import org.opensearch.core.tasks.TaskCancelledException
+import org.opensearch.index.IndexNotFoundException
+import org.opensearch.indices.IndexClosedException
 import org.opensearch.node.NodeClosedException
 import org.opensearch.script.Script
 import org.opensearch.transport.NodeNotConnectedException
@@ -328,6 +334,80 @@ fun isNodeUnavailableFailure(e: Exception): Boolean {
         }
         val message = cause.message
         if (message != null && NODE_UNAVAILABLE_EXCEPTION_NAMES.any { message.startsWith("$it:") }) {
+            return true
+        }
+        val next = cause.cause
+        cause = if (next === cause) null else next
+    }
+    return false
+}
+
+/**
+ * Class names recorded by `AlertingException.wrap()` for the transient failures below, for the same reason
+ * [NODE_UNAVAILABLE_EXCEPTION_NAMES] exists: the original type does not survive flattening.
+ */
+private val TRANSIENT_EXCEPTION_NAMES = setOf(
+    TaskCancelledException::class.java.name,
+    CircuitBreakingException::class.java.name,
+    OpenSearchRejectedExecutionException::class.java.name,
+    IndexClosedException::class.java.name,
+    IndexNotFoundException::class.java.name
+)
+
+/**
+ * The deepest cause of [e] rendered as `SimpleName: message`.
+ *
+ * Lets a failure be reported on one line, naming the real reason without attaching a stack trace. For a
+ * search cancelled by backpressure this reaches the `TaskCancelledException` and its reason, because
+ * `SearchPhaseExecutionException` wires its first shard failure's cause into its own cause chain.
+ */
+fun rootCauseMessage(e: Throwable): String {
+    var cause: Throwable = e
+    var depth = 0
+    while (depth++ < MAX_CAUSE_CHAIN_DEPTH) {
+        val next = cause.cause ?: break
+        if (next === cause) break
+        cause = next
+    }
+    return "${cause.javaClass.simpleName}: ${cause.message}"
+}
+
+/**
+ * Returns true when [e], or any cause it wraps, describes a condition that may simply not be there next
+ * time, rather than a defect in the request itself. Two families qualify:
+ *
+ * - the cluster refused to finish the work for want of resources -- `SearchBackpressureService` cancelling
+ *   the task in enforced mode, a tripped circuit breaker, a rejected execution;
+ * - an index the work needs is closed or missing, which an operator can undo by reopening or recreating it.
+ *
+ * Neither says the work is invalid, so the caller can leave it for the next run instead of discarding it. A
+ * defect that would fail identically forever -- a mapping conflict, an unparseable query -- must not be
+ * classified here, or the work would be retried indefinitely and never make progress.
+ *
+ * A cancelled search reaches the client as a `SearchPhaseExecutionException` ("all shards failed") whose
+ * per-shard causes carry the real reason. Only the *first* shard failure is wired into the exception's own
+ * cause chain, so every shard failure is inspected too: the cancelled shard need not be the first one.
+ */
+fun isTransientFailure(e: Throwable): Boolean {
+    var cause: Throwable? = e
+    var depth = 0
+    while (cause != null && depth++ < MAX_CAUSE_CHAIN_DEPTH) {
+        if (cause is TaskCancelledException ||
+            cause is CircuitBreakingException ||
+            cause is OpenSearchRejectedExecutionException ||
+            cause is IndexClosedException ||
+            cause is IndexNotFoundException
+        ) {
+            return true
+        }
+        val message = cause.message
+        if (message != null && TRANSIENT_EXCEPTION_NAMES.any { message.startsWith("$it:") }) {
+            return true
+        }
+        val current = cause
+        if (current is SearchPhaseExecutionException &&
+            current.shardFailures().any { failure -> failure.cause?.let { isTransientFailure(it) } == true }
+        ) {
             return true
         }
         val next = cause.cause
