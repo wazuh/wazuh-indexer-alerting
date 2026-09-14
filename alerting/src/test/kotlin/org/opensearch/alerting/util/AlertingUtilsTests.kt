@@ -8,6 +8,8 @@ package org.opensearch.alerting.util
 import org.mockito.Mockito.mock
 import org.opensearch.OpenSearchException
 import org.opensearch.Version
+import org.opensearch.action.search.SearchPhaseExecutionException
+import org.opensearch.action.search.ShardSearchFailure
 import org.opensearch.alerting.AlertService
 import org.opensearch.alerting.MonitorRunnerService
 import org.opensearch.alerting.model.AlertContext
@@ -23,6 +25,13 @@ import org.opensearch.cluster.node.DiscoveryNode
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.unit.TimeValue
 import org.opensearch.commons.alerting.util.AlertingException
+import org.opensearch.core.common.breaker.CircuitBreaker
+import org.opensearch.core.common.breaker.CircuitBreakingException
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException
+import org.opensearch.core.index.Index
+import org.opensearch.core.tasks.TaskCancelledException
+import org.opensearch.index.IndexNotFoundException
+import org.opensearch.indices.IndexClosedException
 import org.opensearch.node.NodeClosedException
 import org.opensearch.test.OpenSearchTestCase
 import org.opensearch.transport.NodeNotConnectedException
@@ -313,5 +322,138 @@ class AlertingUtilsTests : OpenSearchTestCase() {
         val converted = AlertingException.wrap(IllegalStateException("boom")) as Exception
 
         assertFalse(isNodeUnavailableFailure(converted))
+    }
+
+    /**
+     * The shape a search cancelled by `SearchBackpressureService` reaches the doc-level monitor in: the
+     * per-shard causes carry the cancellation, the top-level message is only "all shards failed", and
+     * `runPercolateQueryOnTransformedDocs` wraps the whole thing in an `IllegalStateException`.
+     */
+    private fun cancelledPercolateSearch(docCount: Int): Exception {
+        val cancelled = SearchPhaseExecutionException(
+            "query",
+            "all shards failed",
+            arrayOf(ShardSearchFailure(TaskCancelledException("cancelled task with reason: heap usage exceeded")))
+        )
+        return IllegalStateException(
+            "Monitor cTQAX6AByhfuyTxXQx58: Failed to run percolate search for sourceIndex " +
+                "[.ds-wazuh-events-v5-cloud-services-000001] and queryIndex " +
+                "[.opensearch-sap-wazuh-generic-1-detectors-queries-optimized-b533ad98-000002] " +
+                "for $docCount document(s)",
+            cancelled
+        )
+    }
+
+    fun `test cancelled task is a transient failure`() {
+        assertTrue(isTransientFailure(TaskCancelledException("cancelled task with reason: heap usage exceeded")))
+    }
+
+    fun `test rejected execution is a transient failure`() {
+        assertTrue(isTransientFailure(OpenSearchRejectedExecutionException("rejected")))
+    }
+
+    fun `test tripped circuit breaker is a transient failure`() {
+        val tripped = CircuitBreakingException("[parent] Data too large", 1024, 512, CircuitBreaker.Durability.TRANSIENT)
+        assertTrue(isTransientFailure(tripped))
+    }
+
+    fun `test backpressure cancellation is recognised through the percolate search wrapper`() {
+        // The whole point of the fix: this is what the monitor actually catches, and it must be retried
+        // at a smaller batch size rather than having the batch discarded.
+        assertTrue(isTransientFailure(cancelledPercolateSearch(40000)))
+    }
+
+    fun `test all shards failed without a cancellation is not a transient failure`() {
+        // "all shards failed" on its own says nothing about resources, so it must not trigger a retry.
+        val failed = SearchPhaseExecutionException(
+            "query",
+            "all shards failed",
+            arrayOf(ShardSearchFailure(IllegalArgumentException("bad query")))
+        )
+        assertFalse(isTransientFailure(failed))
+    }
+
+    fun `test genuine failure is not a transient failure`() {
+        assertFalse(isTransientFailure(OpenSearchException("query index missing")))
+        assertFalse(isTransientFailure(IllegalStateException("boom")))
+        assertFalse(isTransientFailure(IOException("disk gone")))
+    }
+
+    fun `test cancellation already converted to an AlertingException is a transient failure`() {
+        // wrap() flattens the cause to Exception("<class name>: <msg>"), so the class name is all that is left.
+        val converted = AlertingException.wrap(TaskCancelledException("cancelled task")) as Exception
+        assertTrue(isTransientFailure(converted))
+    }
+
+    fun `test a cancellation on a later shard is still a transient failure`() {
+        // Only the first shard failure is wired into the cause chain, so the scan over all of them matters.
+        val failed = SearchPhaseExecutionException(
+            "query",
+            "all shards failed",
+            arrayOf(
+                ShardSearchFailure(IllegalArgumentException("bad query")),
+                ShardSearchFailure(TaskCancelledException("cancelled task with reason: heap usage exceeded"))
+            )
+        )
+        assertTrue(isTransientFailure(failed))
+    }
+
+    fun `test closed index is a transient failure`() {
+        // An operator can reopen a closed index, so the documents are worth holding for the next run
+        // rather than abandoning.
+        assertTrue(isTransientFailure(IndexClosedException(Index("some-index", "uuid"))))
+    }
+
+    fun `test missing index is a transient failure`() {
+        assertTrue(isTransientFailure(IndexNotFoundException("some-index")))
+    }
+
+    fun `test closed query index is transient through the percolate search wrapper`() {
+        // The shape that reaches the monitor when the detector query index is closed: the batch must be
+        // deferred, not abandoned, so reopening the index does not cost the documents indexed meanwhile.
+        val wrapped = IllegalStateException(
+            "Monitor abc: Failed to run percolate search for sourceIndex [src] and queryIndex [q] for 1 document(s)",
+            IndexClosedException(Index("q", "uuid"))
+        )
+        assertTrue(isTransientFailure(wrapped))
+    }
+
+    fun `test a query defect is not a transient failure`() {
+        // Would fail identically on every run, so deferring it would stall the monitor forever.
+        val defect = IllegalStateException(
+            "Monitor abc: Failed to run percolate search for sourceIndex [src] and queryIndex [q] for 1 document(s)",
+            IllegalArgumentException("failed to parse query")
+        )
+        assertFalse(isTransientFailure(defect))
+    }
+
+    fun `test transient classification terminates on a self-referencing cause`() {
+        val looping = object : RuntimeException("looping") {
+            override val cause: Throwable get() = this
+        }
+        assertFalse(isTransientFailure(looping))
+    }
+
+    fun `test rootCauseMessage names the real reason without a trace`() {
+        // What the log line for a deferred batch has to carry: SearchPhaseExecutionException wires its
+        // first shard failure into its cause chain, so this reaches the cancellation and its reason.
+        val summary = rootCauseMessage(cancelledPercolateSearch(50000))
+
+        assertEquals("TaskCancelledException: cancelled task with reason: heap usage exceeded", summary)
+        assertFalse("Must not carry a stack trace", summary.contains("\n"))
+    }
+
+    fun `test rootCauseMessage unwraps to the deepest cause`() {
+        val breaker = CircuitBreakingException("[parent] Data too large", 1024, 512, CircuitBreaker.Durability.TRANSIENT)
+        val wrapped = IllegalStateException("percolate failed", RemoteTransportException("hop", breaker))
+
+        assertEquals("CircuitBreakingException: [parent] Data too large", rootCauseMessage(wrapped))
+    }
+
+    fun `test rootCauseMessage terminates on a self-referencing cause`() {
+        val looping = object : RuntimeException("looping") {
+            override val cause: Throwable get() = this
+        }
+        assertEquals("looping", rootCauseMessage(looping).substringAfter(": "))
     }
 }
