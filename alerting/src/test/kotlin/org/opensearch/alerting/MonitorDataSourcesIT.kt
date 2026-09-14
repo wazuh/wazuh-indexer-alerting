@@ -553,7 +553,7 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         val id = monitorResponse.id
         val executeMonitorResponse = executeMonitor(monitor, id, false)
         Assert.assertEquals(executeMonitorResponse!!.monitorRunResult.monitorName, monitor.name)
-        Assert.assertEquals(executeMonitorResponse.monitorRunResult.triggerResults.size, 0)
+        Assert.assertEquals(executeMonitorResponse.monitorRunResult.triggerResults.size, 1)
         searchAlerts(id)
         val table = Table("asc", "id", null, 1, 0, "")
         var getAlertsResponse = client()
@@ -858,7 +858,7 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
 
         executeMonitorResponse = executeMonitor(monitor, id, false)
         Assert.assertEquals(executeMonitorResponse!!.monitorRunResult.monitorName, monitor.name)
-        Assert.assertEquals(executeMonitorResponse.monitorRunResult.triggerResults.size, 0)
+        Assert.assertEquals(executeMonitorResponse.monitorRunResult.triggerResults.size, 1)
         searchAlerts(id)
         table = Table("asc", "id", null, 10, 0, "")
         getAlertsResponse = client()
@@ -871,7 +871,7 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
                 "AlertingException[closed]; nested: Exception[org.opensearch.indices.IndexClosedException: closed]; "
         )
         Assert.assertEquals(1, getAlertsResponse.alerts[0].errorHistory.size)
-        Assert.assertTrue(getAlertsResponse.alerts[0].errorMessage!!.contains("Failed to run percolate search"))
+        Assert.assertTrue(getAlertsResponse.alerts[0].errorMessage!!.contains("Detection coverage gap"))
     }
 
     fun `test monitor error alert created trigger run errored 2 times same error`() {

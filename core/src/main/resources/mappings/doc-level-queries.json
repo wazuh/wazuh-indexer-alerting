@@ -11,6 +11,9 @@
     },
     "index": {
       "type": "text"
+    },
+    "wazuh_absent_field_sentinel": {
+      "type": "keyword"
     }
   }
 }
