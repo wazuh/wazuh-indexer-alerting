@@ -115,7 +115,7 @@ fun Action.getActionExecutionPolicy(monitor: Monitor): ActionExecutionPolicy? {
     // the parse.
     return this.actionExecutionPolicy ?: if (monitor.isBucketLevelMonitor()) {
         ActionExecutionPolicy.getDefaultConfigurationForBucketLevelMonitor()
-    } else if (monitor.isDocLevelMonitor()) {
+    } else if (monitor.isDocLevelMonitor() || monitor.isActiveResponseMonitor()) {
         ActionExecutionPolicy.getDefaultConfigurationForDocumentLevelMonitor()
     } else {
         null
@@ -136,6 +136,37 @@ fun BucketLevelTriggerRunResult.getCombinedTriggerRunResult(
     val error = this.error ?: prevTriggerRunResult.error
 
     return this.copy(aggregationResultBuckets = mergedAggregationResultBuckets, actionResultsMap = mergedActionResultsMap, error = error)
+}
+
+/**
+ * Active response actions carry a single `<doc_id>|<index>` per message, so they always run per alert:
+ * falling back to one execution for the whole run would answer only the first matched event.
+ * Every other monitor type follows [defaultToPerExecutionAction].
+ */
+fun defaultToPerExecutionAction(
+    maxActionableAlertCount: Long,
+    monitor: Monitor,
+    triggerId: String,
+    totalActionableAlertCount: Int,
+    monitorOrTriggerError: Exception?
+): Boolean {
+    if (monitor.isActiveResponseMonitor()) {
+        if (monitorOrTriggerError != null) {
+            logger.warn(
+                "Trigger [$triggerId] in active response monitor [${monitor.id}] encountered an error. " +
+                    "Still running actions per alert for [$totalActionableAlertCount] alerts.",
+                monitorOrTriggerError
+            )
+        }
+        return false
+    }
+    return defaultToPerExecutionAction(
+        maxActionableAlertCount,
+        monitorId = monitor.id,
+        triggerId = triggerId,
+        totalActionableAlertCount = totalActionableAlertCount,
+        monitorOrTriggerError = monitorOrTriggerError
+    )
 }
 
 fun defaultToPerExecutionAction(

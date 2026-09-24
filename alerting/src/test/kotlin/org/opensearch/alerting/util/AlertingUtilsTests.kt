@@ -16,6 +16,7 @@ import org.opensearch.alerting.model.AlertContext
 import org.opensearch.alerting.randomAction
 import org.opensearch.alerting.randomBucketLevelTrigger
 import org.opensearch.alerting.randomChainedAlertTrigger
+import org.opensearch.alerting.randomDocumentLevelMonitor
 import org.opensearch.alerting.randomDocumentLevelTrigger
 import org.opensearch.alerting.randomQueryLevelTrigger
 import org.opensearch.alerting.randomTemplateScript
@@ -24,6 +25,9 @@ import org.opensearch.alerting.script.DocumentLevelTriggerExecutionContext
 import org.opensearch.cluster.node.DiscoveryNode
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.unit.TimeValue
+import org.opensearch.commons.alerting.model.Monitor
+import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
+import org.opensearch.commons.alerting.model.action.PerAlertActionScope
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.core.common.breaker.CircuitBreaker
 import org.opensearch.core.common.breaker.CircuitBreakingException
@@ -455,5 +459,29 @@ class AlertingUtilsTests : OpenSearchTestCase() {
             override val cause: Throwable get() = this
         }
         assertEquals("looping", rootCauseMessage(looping).substringAfter(": "))
+    }
+
+    fun `test active response monitor never defaults to per execution`() {
+        val monitor = randomDocumentLevelMonitor().copy(monitorType = Monitor.MonitorType.ACTIVE_RESPONSE_MONITOR.value)
+
+        assertFalse(defaultToPerExecutionAction(50L, monitor, "trigger", 100, null))
+        assertFalse(defaultToPerExecutionAction(50L, monitor, "trigger", 1, IOException("boom")))
+    }
+
+    fun `test document level monitor defaults to per execution above the cap or on error`() {
+        val monitor = randomDocumentLevelMonitor()
+
+        assertFalse(defaultToPerExecutionAction(50L, monitor, "trigger", 50, null))
+        assertTrue(defaultToPerExecutionAction(50L, monitor, "trigger", 51, null))
+        assertFalse(defaultToPerExecutionAction(-1L, monitor, "trigger", 1000, null))
+        assertTrue(defaultToPerExecutionAction(50L, monitor, "trigger", 1, IOException("boom")))
+    }
+
+    fun `test active response monitor action without a policy defaults to per alert`() {
+        val monitor = randomDocumentLevelMonitor().copy(monitorType = Monitor.MonitorType.ACTIVE_RESPONSE_MONITOR.value)
+        val policy = randomAction().getActionExecutionPolicy(monitor)
+
+        assertEquals(ActionExecutionPolicy.getDefaultConfigurationForDocumentLevelMonitor(), policy)
+        assertTrue(policy!!.actionExecutionScope is PerAlertActionScope)
     }
 }

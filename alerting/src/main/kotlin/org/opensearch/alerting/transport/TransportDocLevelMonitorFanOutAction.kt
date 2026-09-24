@@ -546,7 +546,7 @@ class TransportDocLevelMonitorFanOutAction
 
         val shouldDefaultToPerExecution = defaultToPerExecutionAction(
             maxActionableAlertCount,
-            monitorId = monitor.id,
+            monitor = monitor,
             triggerId = trigger.id,
             totalActionableAlertCount = alerts.size,
             monitorOrTriggerError = actionCtx.error

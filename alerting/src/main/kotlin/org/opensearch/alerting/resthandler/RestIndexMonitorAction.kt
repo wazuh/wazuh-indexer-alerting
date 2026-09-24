@@ -21,6 +21,7 @@ import org.opensearch.commons.alerting.model.IntervalSchedule
 import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.QueryLevelTrigger
 import org.opensearch.commons.alerting.model.ScheduledJob
+import org.opensearch.commons.alerting.model.action.PerExecutionActionScope
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.commons.alerting.util.isMonitorOfStandardType
 import org.opensearch.commons.utils.getInvalidNameChars
@@ -152,6 +153,7 @@ class RestIndexMonitorAction : BaseRestHandler() {
                         }
                         validateActiveResponseIndices(monitor)
                         validateActiveResponseSchedule(monitor)
+                        validateActiveResponseActionScope(monitor)
                     }
                 }
             }
@@ -194,6 +196,20 @@ class RestIndexMonitorAction : BaseRestHandler() {
                         "Active response monitor indices must start with '$ACTIVE_RESPONSE_INDEX_PREFIX'; found: $idx"
                     )
                 }
+            }
+        }
+    }
+
+    /**
+     * Each active response message carries a single `<doc_id>|<index>`, so a per-execution action would
+     * answer only the first alert of a run.
+     */
+    private fun validateActiveResponseActionScope(monitor: Monitor) {
+        monitor.triggers.flatMap { it.actions }.forEach { action ->
+            if (action.actionExecutionPolicy?.actionExecutionScope is PerExecutionActionScope) {
+                throw IllegalArgumentException(
+                    "Active response monitor actions must use the per_alert execution scope; action [${action.name}] uses per_execution"
+                )
             }
         }
     }

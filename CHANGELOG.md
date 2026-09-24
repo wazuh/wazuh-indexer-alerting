@@ -25,6 +25,7 @@
 - Recognise an orderly node shutdown in the remaining alerting error paths instead of logging it as a failure [(#1867)](https://github.com/wazuh/wazuh-indexer/issues/1867) [(#1788)](https://github.com/wazuh/wazuh-indexer/issues/1788)
 - Doc-level monitors no longer skip documents when search backpressure cancels their percolate search [(#1876)](https://github.com/wazuh/wazuh-indexer/issues/1876)
 - Fix rules over a field that the source index does not map being silently dropped, which left missing-field detection unable to ever match [(#1518)](https://github.com/wazuh/wazuh-indexer-plugins/issues/1518)
+- Active Response monitors now send one response per matched event instead of one per run once a run exceeds `plugins.alerting.max_actionable_alert_count` or carries an error [(#1941)](https://github.com/wazuh/wazuh-indexer/issues/1941)
 
 ## Prior versions
 - []()
