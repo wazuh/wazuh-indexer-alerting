@@ -21,6 +21,7 @@ import org.opensearch.commons.alerting.model.DataSources
 import org.opensearch.commons.alerting.model.DocLevelMonitorInput
 import org.opensearch.commons.alerting.model.DocLevelQuery
 import org.opensearch.commons.alerting.model.IntervalSchedule
+import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
 import org.opensearch.commons.alerting.model.action.AlertCategory
 import org.opensearch.commons.alerting.model.action.PerAlertActionScope
@@ -3037,5 +3038,51 @@ class DocumentMonitorRunnerIT : AlertingRestTestCase() {
             }, 2, TimeUnit.MINUTES
         )
         assertEquals(found.get(), false)
+    }
+
+    fun `test active response monitor runs a per execution action once per alert`() {
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        val testDoc = """{
+            "message" : "This is an error from IAD region",
+            "test_strict_date_time" : "$testTime",
+            "test_field" : "us-west-2"
+        }"""
+
+        val index = createTestIndex()
+
+        val docQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "3", fields = listOf())
+        val docLevelInput = DocLevelMonitorInput("description", listOf(index), listOf(docQuery))
+
+        // The REST index handler rejects this scope for active response monitors, but a monitor stored before that
+        // validation, or indexed over the transport layer, can still carry it. Executing it inline skips that validation.
+        val action = randomActionWithPolicy(
+            template = randomTemplateScript("{{ctx.alerts.0.related_doc_ids}}"),
+            destinationId = createDestination().id,
+            actionExecutionPolicy = ActionExecutionPolicy(PerExecutionActionScope())
+        )
+        val monitor = randomDocumentLevelMonitor(
+            inputs = listOf(docLevelInput),
+            triggers = listOf(randomDocumentLevelTrigger(condition = ALWAYS_RUN, actions = listOf(action)))
+        ).copy(monitorType = Monitor.MonitorType.ACTIVE_RESPONSE_MONITOR.value)
+
+        indexDoc(index, "1", testDoc)
+        indexDoc(index, "2", testDoc)
+        indexDoc(index, "3", testDoc)
+
+        val response = executeMonitor(monitor, params = DRYRUN_MONITOR)
+
+        val output = entityAsMap(response)
+        assertEquals(monitor.name, output["monitor_name"])
+
+        for (triggerResult in output.objectMap("trigger_results").values) {
+            val alertActionResults = triggerResult.objectMap("action_results").values
+            assertEquals(3, alertActionResults.size)
+            // One execution per alert renders each alert's own document; a single execution would render the first one for all
+            val messages = alertActionResults.flatMap { it.values }.map {
+                @Suppress("UNCHECKED_CAST")
+                ((it as Map<String, Map<String, String>>)["output"] as Map<String, String>)["message"]
+            }
+            assertEquals("Expected one action execution per alert, got messages $messages", 3, messages.toSet().size)
+        }
     }
 }
