@@ -22,6 +22,7 @@ import org.opensearch.alerting.model.destination.Chime
 import org.opensearch.alerting.model.destination.Destination
 import org.opensearch.alerting.randomADMonitor
 import org.opensearch.alerting.randomAction
+import org.opensearch.alerting.randomActionWithPolicy
 import org.opensearch.alerting.randomAlert
 import org.opensearch.alerting.randomAnomalyDetector
 import org.opensearch.alerting.randomAnomalyDetectorWithUser
@@ -47,10 +48,13 @@ import org.opensearch.commons.alerting.model.CronSchedule
 import org.opensearch.commons.alerting.model.DocLevelMonitorInput
 import org.opensearch.commons.alerting.model.DocLevelQuery
 import org.opensearch.commons.alerting.model.DocumentLevelTrigger
+import org.opensearch.commons.alerting.model.IntervalSchedule
 import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.QueryLevelTrigger
 import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.model.SearchInput
+import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
+import org.opensearch.commons.alerting.model.action.PerExecutionActionScope
 import org.opensearch.commons.utils.getInvalidNameChars
 import org.opensearch.core.common.bytes.BytesReference
 import org.opensearch.core.rest.RestStatus
@@ -1358,6 +1362,23 @@ class MonitorRestApiIT : AlertingRestTestCase() {
                 "Incompatible trigger [${trigger.id}] for monitor type [${Monitor.MonitorType.DOC_LEVEL_MONITOR}]",
                 e.message
             )
+        }
+    }
+
+    fun `test creating an active response monitor with a per execution action`() {
+        val action = randomActionWithPolicy(actionExecutionPolicy = ActionExecutionPolicy(PerExecutionActionScope()))
+        val monitor = randomDocumentLevelMonitor(
+            inputs = listOf(DocLevelMonitorInput("description", listOf("wazuh-findings-v5-test"), emptyList())),
+            schedule = IntervalSchedule(interval = 1, unit = ChronoUnit.MINUTES),
+            triggers = listOf(randomDocumentLevelTrigger(actions = listOf(action)))
+        ).copy(monitorType = Monitor.MonitorType.ACTIVE_RESPONSE_MONITOR.value)
+
+        try {
+            client().makeRequest("POST", ALERTING_BASE_URI, emptyMap(), monitor.toHttpEntity())
+            fail("Active response monitor with a per execution action should be rejected")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.BAD_REQUEST, e.response.restStatus())
+            e.message?.let { assertTrue(it.contains("Active response monitor actions must use the per_alert execution scope")) }
         }
     }
 
