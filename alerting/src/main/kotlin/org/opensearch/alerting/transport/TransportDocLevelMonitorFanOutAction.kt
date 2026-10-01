@@ -60,6 +60,7 @@ import org.opensearch.alerting.util.destinationmigration.publishLegacyNotificati
 import org.opensearch.alerting.util.destinationmigration.sendNotification
 import org.opensearch.alerting.util.getActionExecutionPolicy
 import org.opensearch.alerting.util.getCancelAfterTimeInterval
+import org.opensearch.alerting.util.isActiveResponseMonitor
 import org.opensearch.alerting.util.isAllowed
 import org.opensearch.alerting.util.isTestAction
 import org.opensearch.alerting.util.isTransientFailure
@@ -546,7 +547,7 @@ class TransportDocLevelMonitorFanOutAction
 
         val shouldDefaultToPerExecution = defaultToPerExecutionAction(
             maxActionableAlertCount,
-            monitorId = monitor.id,
+            monitor = monitor,
             triggerId = trigger.id,
             totalActionableAlertCount = alerts.size,
             monitorOrTriggerError = actionCtx.error
@@ -554,7 +555,7 @@ class TransportDocLevelMonitorFanOutAction
 
         for (action in trigger.actions) {
             val actionExecutionScope = action.getActionExecutionPolicy(monitor)!!.actionExecutionScope
-            if (actionExecutionScope is PerAlertActionScope && !shouldDefaultToPerExecution) {
+            if ((actionExecutionScope is PerAlertActionScope || monitor.isActiveResponseMonitor()) && !shouldDefaultToPerExecution) {
                 for (alertContext in alertContexts) {
                     val actionResults = this.runAction(action, actionCtx.copy(alerts = listOf(alertContext)), monitor, dryrun)
                     triggerResult.actionResultsMap.getOrPut(alertContext.alert.id) { mutableMapOf() }
