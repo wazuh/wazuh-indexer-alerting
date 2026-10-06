@@ -17,11 +17,16 @@ import org.opensearch.alerting.settings.DestinationSettings
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
 import org.opensearch.common.util.concurrent.ThreadContext
+import org.opensearch.common.xcontent.LoggingDeprecationHandler
+import org.opensearch.common.xcontent.XContentFactory
+import org.opensearch.common.xcontent.XContentHelper
+import org.opensearch.common.xcontent.XContentType
 import org.opensearch.commons.alerting.model.AggregationResultBucket
 import org.opensearch.commons.alerting.model.BucketLevelTrigger
 import org.opensearch.commons.alerting.model.BucketLevelTriggerRunResult
 import org.opensearch.commons.alerting.model.DocumentLevelTrigger
 import org.opensearch.commons.alerting.model.Monitor
+import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.model.Trigger
 import org.opensearch.commons.alerting.model.action.Action
 import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
@@ -29,8 +34,11 @@ import org.opensearch.commons.alerting.model.action.ActionExecutionScope
 import org.opensearch.commons.alerting.util.isBucketLevelMonitor
 import org.opensearch.commons.alerting.util.isMonitorOfStandardType
 import org.opensearch.core.common.breaker.CircuitBreakingException
+import org.opensearch.core.common.bytes.BytesReference
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException
 import org.opensearch.core.tasks.TaskCancelledException
+import org.opensearch.core.xcontent.NamedXContentRegistry
+import org.opensearch.core.xcontent.ToXContent
 import org.opensearch.index.IndexNotFoundException
 import org.opensearch.indices.IndexClosedException
 import org.opensearch.node.NodeClosedException
@@ -445,4 +453,104 @@ fun isTransientFailure(e: Throwable): Boolean {
         cause = if (next === cause) null else next
     }
     return false
+}
+
+/**
+ * Returns true when updating [currentMonitor] to [updatedMonitor] rewrites the doc-level queries
+ * the monitor percolates against.
+ *
+ * The queries are built from [Monitor.inputs] and written to the query index named by
+ * [Monitor.dataSources]. An update that leaves both untouched -- a ruleset sync that did not alter
+ * this detector, say -- produces the same documents in the same place, so there is nothing to
+ * rewrite.
+ *
+ * This is the single definition of "the queries changed", shared by the two sides that have to
+ * agree on it: the update path, which skips the rewrite when this is false, and the monitor run,
+ * which discards its checkpoint when this is true. Were they allowed to answer differently, a
+ * rewrite could happen without a run noticing it, and that run would store a checkpoint covering
+ * documents it percolated while its queries were absent from the index.
+ */
+fun docLevelQueriesChanged(currentMonitor: Monitor, updatedMonitor: Monitor): Boolean =
+    currentMonitor.inputs != updatedMonitor.inputs || currentMonitor.dataSources != updatedMonitor.dataSources
+
+/**
+ * Returns [monitor] as reading back the document it is stored as would produce it.
+ *
+ * [docLevelQueriesChanged] is answered on both sides of a race: the update path compares the stored
+ * monitor with the one it is about to store, and a running monitor compares the copy it started
+ * with against the stored one. The second comparison only ever sees parsed monitors, so the first
+ * has to as well. Compared as built in memory, a monitor that does not survive a round trip
+ * unchanged would read as changed to the update path, which then rewrites the queries, and as
+ * unchanged to the run, which then stores a checkpoint over documents percolated while its queries
+ * were being rewritten.
+ */
+fun storedForm(monitor: Monitor, xContentRegistry: NamedXContentRegistry): Monitor {
+    val source = BytesReference.bytes(
+        monitor.toXContentWithUser(XContentFactory.jsonBuilder(), ToXContent.MapParams(mapOf("with_type" to "true")))
+    )
+    XContentHelper.createParser(xContentRegistry, LoggingDeprecationHandler.INSTANCE, source, XContentType.JSON).use { xcp ->
+        return ScheduledJob.parse(xcp, monitor.id, monitor.version) as Monitor
+    }
+}
+
+/**
+ * Merges the checkpoint a doc-level run produced into the one its metadata document holds now.
+ *
+ * Three states take part: what the run read when it started ([base]), what it produced ([ours]),
+ * and what the document holds after the other writer ([theirs]).
+ *
+ * - An index the run tracked keeps the run's shard checkpoints, except where the other writer's
+ *   are further ahead: a re-enabled monitor is given a context reset to the current checkpoints,
+ *   and that reset must survive the merge rather than be rolled back to where the run happened to be.
+ * - An index only the other writer knows about was registered while the run was in flight. The run
+ *   never saw it, so its checkpoint is taken as it stands.
+ * - An index the run read and then dropped was dropped deliberately: a data stream's previous write
+ *   index is removed from the context once it rolls over. Restoring it would leave every later run
+ *   walking a shard that no longer receives documents.
+ */
+fun mergeRunCheckpoints(base: Map<String, Any>, ours: Map<String, Any>, theirs: Map<String, Any>): Map<String, Any> {
+    val merged = LinkedHashMap<String, Any>(ours)
+    theirs.forEach { (indexName, theirCheckpoints) ->
+        val ourCheckpoints = merged[indexName]
+        if (ourCheckpoints == null) {
+            if (!base.containsKey(indexName)) {
+                merged[indexName] = theirCheckpoints
+            }
+            return@forEach
+        }
+        if (ourCheckpoints is Map<*, *> && theirCheckpoints is Map<*, *>) {
+            merged[indexName] = mergeShardCheckpoints(ourCheckpoints, theirCheckpoints)
+        }
+    }
+    return merged
+}
+
+/**
+ * Keeps the higher of the two sequence numbers for each shard of one index.
+ *
+ * Only the numeric keys are shard checkpoints. `index` and `shards_count` describe the index itself,
+ * carry no ordering, and keep the run's view of it.
+ */
+fun mergeShardCheckpoints(ours: Map<*, *>, theirs: Map<*, *>): MutableMap<String, Any> {
+    val merged = LinkedHashMap<String, Any>()
+    ours.forEach { (key, value) -> if (key is String && value != null) merged[key] = value }
+    theirs.forEach { (key, theirValue) ->
+        if (key !is String || theirValue == null) {
+            return@forEach
+        }
+        val ourValue = merged[key]
+        if (ourValue == null) {
+            merged[key] = theirValue
+            return@forEach
+        }
+        if (key.toIntOrNull() == null) {
+            return@forEach
+        }
+        val ourSeqNo = (ourValue as? Number)?.toLong()
+        val theirSeqNo = (theirValue as? Number)?.toLong()
+        if (ourSeqNo != null && theirSeqNo != null && theirSeqNo > ourSeqNo) {
+            merged[key] = theirValue
+        }
+    }
+    return merged
 }

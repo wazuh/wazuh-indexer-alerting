@@ -23,6 +23,7 @@
 -
 
 ### Fixed
+- Fix doc-level monitor runs being abandoned, or losing documents, when their detector is updated while they run [(#1968)](https://github.com/wazuh/wazuh-indexer/issues/1968)
 - Fix doc-level monitors skipping documents when search backpressure cancels their percolate search [(#1876)](https://github.com/wazuh/wazuh-indexer/issues/1876)
 - Fix rules over a field the source index does not map being silently dropped [(#1518)](https://github.com/wazuh/wazuh-indexer-plugins/issues/1518)
 - Fix one failing finding dropping the rest of its batch before it reaches Security Analytics [(#168)](https://github.com/wazuh/wazuh-indexer-security-analytics/issues/168)
