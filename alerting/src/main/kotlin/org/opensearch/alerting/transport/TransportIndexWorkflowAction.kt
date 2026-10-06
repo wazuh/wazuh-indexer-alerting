@@ -588,13 +588,8 @@ class TransportIndexWorkflowAction @Inject constructor(
                         val oldMonitorMetadata = MonitorMetadataService.getMetadata(monitor)
                         updatedMetadata = updatedMetadata.copy(sourceToQueryIndexMapping = oldMonitorMetadata!!.sourceToQueryIndexMapping)
 
-                        // A workflow update walks every delegate and rewrote this document on each
-                        // pass, whether or not it had anything new to say. The write is not free to
-                        // anyone else: it moves the document's sequence number, and a doc-level run
-                        // that read the metadata when it started writes its checkpoint back
-                        // conditionally on that number. Under load a run lasts minutes, so an update
-                        // landing inside one is ordinary, and the run it displaced used to be
-                        // abandoned over a document that had not changed. Write only when it has.
+                        // Write only when something changed: every write moves the document's sequence
+                        // number and makes a running monitor's checkpoint write conflict.
                         val metadataChanged = isWorkflowRestarted ||
                             updatedMetadata.lastRunContext != monitorMetadata.lastRunContext ||
                             updatedMetadata.sourceToQueryIndexMapping != monitorMetadata.sourceToQueryIndexMapping

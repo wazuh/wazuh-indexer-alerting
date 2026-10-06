@@ -78,7 +78,6 @@ object MonitorMetadataService :
         this.clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.INDEX_TIMEOUT) { indexTimeout = it }
     }
 
-    @Suppress("ComplexMethod", "ReturnCount")
     suspend fun upsertMetadata(metadata: MonitorMetadata, updating: Boolean): MonitorMetadata {
         try {
             return writeMetadata(metadata, updating)
@@ -88,16 +87,9 @@ object MonitorMetadataService :
     }
 
     /**
-     * Writes a doc-level run's checkpoint, conditional on the sequence number [metadata] was read
-     * with, and returns null instead of failing when another writer moved the document first.
-     *
-     * Kept apart from [upsertMetadata] on purpose. The update paths keep that one, where a conflict
-     * means two concurrent edits of the configuration and has to surface. A run that loses this
-     * race merges and retries instead, so the conflict is an expected outcome here, and it must not
-     * go through [AlertingException.wrap], which logs everything it converts as an error and
-     * replaces the exception with a flattened copy. The conflict is recognised through the cause
-     * chain before any conversion, so it is also caught when the primary of the metadata shard sits
-     * on another node and the conflict arrives inside a transport exception.
+     * Like [upsertMetadata], but returns null on a version conflict instead of throwing, so a monitor
+     * run can merge and retry. The cause is unwrapped first, so a conflict coming from another node
+     * is recognised too.
      */
     suspend fun upsertMetadataUnlessConflicting(metadata: MonitorMetadata): MonitorMetadata? {
         try {
@@ -110,6 +102,7 @@ object MonitorMetadataService :
         }
     }
 
+    @Suppress("ComplexMethod", "ReturnCount")
     private suspend fun writeMetadata(metadata: MonitorMetadata, updating: Boolean): MonitorMetadata {
         if (clusterService.state().routingTable.hasIndex(ScheduledJob.SCHEDULED_JOBS_INDEX)) {
             val indexRequest = IndexRequest(ScheduledJob.SCHEDULED_JOBS_INDEX)

@@ -24,11 +24,7 @@ import org.opensearch.test.OpenSearchTestCase
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 
-/**
- * Covers the two halves of wazuh/wazuh-indexer#1968 that need no cluster: the predicate the update
- * path and the monitor run share to decide whether a monitor's queries were rewritten, and the merge
- * a run applies to its checkpoint when another writer moved the metadata document under it.
- */
+/** Tests the doc-level query change check and the run checkpoint merge (wazuh/wazuh-indexer#1968). */
 class RunCheckpointTests : OpenSearchTestCase() {
 
     override fun xContentRegistry(): NamedXContentRegistry {
@@ -77,8 +73,7 @@ class RunCheckpointTests : OpenSearchTestCase() {
         val monitor = docLevelMonitor()
         val stored = storedForm(monitor, xContentRegistry())
         assertFalse(docLevelQueriesChanged(monitor, stored))
-        // Idempotent: storing what was read back changes nothing either, which is what the update
-        // path and a run comparing two parsed copies rely on to agree.
+        // Idempotent: storing it again changes nothing either.
         assertFalse(docLevelQueriesChanged(stored, storedForm(stored, xContentRegistry())))
     }
 

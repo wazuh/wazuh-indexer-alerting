@@ -57,13 +57,7 @@ import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlin.math.max
 
-/**
- * How many times a run attempts to store its checkpoint before reporting the run as failed.
- *
- * The writers it races with touch the metadata document once per update pass, so a handful of
- * attempts gets past a burst of them. Beyond that the conflict is no longer incidental, and the
- * error is the only signal that a monitor has stopped advancing its checkpoint at all.
- */
+/** How many times a run tries to store its checkpoint before failing. */
 private const val MAX_CHECKPOINT_WRITE_ATTEMPTS = 3
 
 open class DocumentLevelMonitorRunner : MonitorRunner() {
@@ -437,13 +431,9 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
             val inputRunResults = buildInputRunResults(docLevelMonitorFanOutResponses)
             if (!isTempMonitor) {
                 if (queriesChangedDuringRun(monitor, monitorCtx)) {
-                    // Updating a monitor rewrites its queries in the query index: they are deleted
-                    // and indexed again, and the two steps are not atomic. A batch percolated in
-                    // between matches nothing, so storing this run's checkpoint would move it past
-                    // documents the run never evaluated, and nothing would ever look at them again.
-                    // Throw the checkpoint away instead. This is not a failure: the findings this
-                    // run did produce stand, and the next run reprocesses the same documents
-                    // against the queries that replaced them.
+                    // The queries were deleted and reindexed during this run, so some documents may
+                    // have been percolated against none. Keep the old checkpoint so the next run
+                    // reprocesses them with the new queries.
                     logger.warn(
                         "Monitor ${monitor.id}: its queries were replaced while this run was in flight. " +
                             "Discarding the run's checkpoint so the next run reprocesses the same documents."
@@ -482,17 +472,9 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
     }
 
     /**
-     * Reports whether the queries this run percolated against are still the ones its monitor
-     * declares.
-     *
-     * The run holds the monitor as it stood when it started; re-reading it says whether an update
-     * landed in the meantime. [docLevelQueriesChanged] is the same predicate the update path uses
-     * to decide whether to rewrite the query index, so the two cannot disagree about whether this
-     * run's queries were replaced underneath it.
-     *
-     * A monitor that cannot be read is reported as changed. Without the comparison there is no
-     * evidence the run's queries survived, and a checkpoint discarded for nothing only costs a
-     * repeat, while one stored for nothing loses detections.
+     * Re-reads the monitor and returns true if its queries changed since this run started, using the
+     * same check as the update path. A monitor that cannot be read counts as changed: reprocessing
+     * is safer than losing documents.
      */
     private suspend fun queriesChangedDuringRun(monitor: Monitor, monitorCtx: MonitorRunnerExecutionContext): Boolean {
         return try {
@@ -506,9 +488,6 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                 ScheduledJobUtils.parseMonitorFromScheduledJobDocSource(monitorCtx.xContentRegistry!!, getResponse)
             val changed = docLevelQueriesChanged(monitor, currentMonitor)
             if (changed) {
-                // Names which half of the comparison moved. A run that discards its checkpoint has
-                // to be read as a real update landing on the monitor; were this to report a change
-                // on every run, the monitor would never advance and this line says where to look.
                 logger.debug(
                     "Monitor {}: inputs changed: {}, data sources changed: {}",
                     monitor.id,
@@ -528,15 +507,8 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
     }
 
     /**
-     * Stores the checkpoint this run reached, retrying when another writer moved the metadata
-     * document in the meantime.
-     *
-     * The write is conditional on the sequence number the run read at its start, so any other
-     * writer of the same document makes it fail. Abandoning the run over it would repeat the whole
-     * run on the next schedule, triggers and their actions included, so the document is re-read,
-     * this run's checkpoint merged into it, and written again. A run only gets here once
-     * [queriesChangedDuringRun] has ruled out that the other writer replaced its queries, which is
-     * what makes the checkpoint safe to keep.
+     * Stores this run's checkpoint. If another writer updated the metadata in the meantime, re-reads
+     * it, merges the checkpoint into it and retries instead of failing the run.
      */
     private suspend fun upsertRunCheckpoint(
         monitor: Monitor,
@@ -549,13 +521,8 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
             if (MonitorMetadataService.upsertMetadataUnlessConflicting(metadata) != null) {
                 return
             }
-            // Re-read rather than reuse what the failed attempt held: every field other than the
-            // checkpoint -- the query index mapping above all -- belongs to whoever wrote last, and
-            // it is that write's sequence number the next attempt has to carry.
             val current = MonitorMetadataService.getMetadata(monitor, workflowRunContext?.workflowMetadataId) ?: break
-            // The query index mapping is the other writer's to set. Only the entries it does not
-            // have are carried over: those are source indices this run registered itself, and
-            // dropping them would leave the queries it indexed for them orphaned.
+            // Keep the other writer's query index mapping, adding only the source indices this run registered.
             val mergedQueryIndexMapping = LinkedHashMap(current.sourceToQueryIndexMapping)
             metadata.sourceToQueryIndexMapping.forEach { (sourceIndex, queryIndex) ->
                 mergedQueryIndexMapping.putIfAbsent(sourceIndex, queryIndex)
@@ -571,8 +538,6 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                 MAX_CHECKPOINT_WRITE_ATTEMPTS
             )
         }
-        // Reported as a failure of the run: the error is the only signal that a monitor has stopped
-        // advancing its checkpoint, so it is kept for the case that is no longer incidental.
         val reason = "Monitor ${monitor.id}: could not store the run's checkpoint, the metadata document kept " +
             "changing after $MAX_CHECKPOINT_WRITE_ATTEMPTS attempts"
         throw AlertingException(reason, RestStatus.CONFLICT, IllegalStateException(reason))

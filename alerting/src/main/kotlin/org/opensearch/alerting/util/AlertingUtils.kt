@@ -456,33 +456,16 @@ fun isTransientFailure(e: Throwable): Boolean {
 }
 
 /**
- * Returns true when updating [currentMonitor] to [updatedMonitor] rewrites the doc-level queries
- * the monitor percolates against.
- *
- * The queries are built from [Monitor.inputs] and written to the query index named by
- * [Monitor.dataSources]. An update that leaves both untouched -- a ruleset sync that did not alter
- * this detector, say -- produces the same documents in the same place, so there is nothing to
- * rewrite.
- *
- * This is the single definition of "the queries changed", shared by the two sides that have to
- * agree on it: the update path, which skips the rewrite when this is false, and the monitor run,
- * which discards its checkpoint when this is true. Were they allowed to answer differently, a
- * rewrite could happen without a run noticing it, and that run would store a checkpoint covering
- * documents it percolated while its queries were absent from the index.
+ * Returns true when updating [currentMonitor] to [updatedMonitor] changes its doc-level queries, that is,
+ * its inputs or the query index they are written to. Shared by the update path, which only rewrites the
+ * queries when this is true, and the monitor run, which discards its checkpoint when it is.
  */
 fun docLevelQueriesChanged(currentMonitor: Monitor, updatedMonitor: Monitor): Boolean =
     currentMonitor.inputs != updatedMonitor.inputs || currentMonitor.dataSources != updatedMonitor.dataSources
 
 /**
- * Returns [monitor] as reading back the document it is stored as would produce it.
- *
- * [docLevelQueriesChanged] is answered on both sides of a race: the update path compares the stored
- * monitor with the one it is about to store, and a running monitor compares the copy it started
- * with against the stored one. The second comparison only ever sees parsed monitors, so the first
- * has to as well. Compared as built in memory, a monitor that does not survive a round trip
- * unchanged would read as changed to the update path, which then rewrites the queries, and as
- * unchanged to the run, which then stores a checkpoint over documents percolated while its queries
- * were being rewritten.
+ * Returns [monitor] as it reads back once stored, so it can be compared with a monitor parsed from the
+ * job index without serialization differences counting as changes.
  */
 fun storedForm(monitor: Monitor, xContentRegistry: NamedXContentRegistry): Monitor {
     val source = BytesReference.bytes(
@@ -494,19 +477,12 @@ fun storedForm(monitor: Monitor, xContentRegistry: NamedXContentRegistry): Monit
 }
 
 /**
- * Merges the checkpoint a doc-level run produced into the one its metadata document holds now.
+ * Merges the checkpoint a doc-level run produced ([ours]) into the one stored after another writer
+ * ([theirs]), given what the run read when it started ([base]):
  *
- * Three states take part: what the run read when it started ([base]), what it produced ([ours]),
- * and what the document holds after the other writer ([theirs]).
- *
- * - An index the run tracked keeps the run's shard checkpoints, except where the other writer's
- *   are further ahead: a re-enabled monitor is given a context reset to the current checkpoints,
- *   and that reset must survive the merge rather than be rolled back to where the run happened to be.
- * - An index only the other writer knows about was registered while the run was in flight. The run
- *   never saw it, so its checkpoint is taken as it stands.
- * - An index the run read and then dropped was dropped deliberately: a data stream's previous write
- *   index is removed from the context once it rolls over. Restoring it would leave every later run
- *   walking a shard that no longer receives documents.
+ * - indices in both keep the highest sequence number per shard;
+ * - indices only in [theirs] are added, unless the run dropped them on purpose (they are in [base]),
+ *   as it does with a data stream's previous write index after a rollover.
  */
 fun mergeRunCheckpoints(base: Map<String, Any>, ours: Map<String, Any>, theirs: Map<String, Any>): Map<String, Any> {
     val merged = LinkedHashMap<String, Any>(ours)
@@ -526,10 +502,8 @@ fun mergeRunCheckpoints(base: Map<String, Any>, ours: Map<String, Any>, theirs: 
 }
 
 /**
- * Keeps the higher of the two sequence numbers for each shard of one index.
- *
- * Only the numeric keys are shard checkpoints. `index` and `shards_count` describe the index itself,
- * carry no ordering, and keep the run's view of it.
+ * Keeps the highest sequence number for each shard of one index. Non-numeric keys (`index`,
+ * `shards_count`) keep [ours].
  */
 fun mergeShardCheckpoints(ours: Map<*, *>, theirs: Map<*, *>): MutableMap<String, Any> {
     val merged = LinkedHashMap<String, Any>()

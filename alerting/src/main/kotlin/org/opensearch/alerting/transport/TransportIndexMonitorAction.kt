@@ -787,19 +787,10 @@ class TransportIndexMonitorAction @Inject constructor(
                     Monitor.MonitorType.valueOf(currentMonitor.monitorType.uppercase(Locale.ROOT)) == Monitor.MonitorType.DOC_LEVEL_MONITOR
                 ) {
                     updatedMetadata = MonitorMetadataService.recreateRunContext(metadata, currentMonitor)
-                    // Whether `recreateRunContext` found a source index the stored context did not
-                    // cover yet. The query index mapping needs no equivalent check: nothing but the
-                    // rewrite below touches it, and the rewrite writes the metadata anyway.
                     val runContextGainedIndices = updatedMetadata.lastRunContext != metadata.lastRunContext
 
-                    // Rewriting the query index means deleting this monitor's queries and indexing
-                    // them again, and the two steps are not atomic: a run percolating in between
-                    // matches nothing and would store a checkpoint covering documents it never
-                    // evaluated. Only an update that actually changes the queries has anything to
-                    // rewrite, so the window is not opened for one that does not -- a ruleset sync
-                    // that left this detector alone, say.
-                    // Compared as it is now stored, not as it was built: the running monitor that has
-                    // to notice this rewrite compares parsed copies, and both sides must agree.
+                    // Deleting and reindexing the queries is not atomic, so only do it when they changed.
+                    // The request is compared in its stored form, as a running monitor will compare it.
                     val queriesChanged = docLevelQueriesChanged(currentMonitor, storedForm(request.monitor, xContentRegistry))
                     if (queriesChanged) {
                         if (docLevelMonitorQueries.docLevelQueryIndexExists(currentMonitor.dataSources)) {
@@ -818,11 +809,8 @@ class TransportIndexMonitorAction @Inject constructor(
                         )
                     }
 
-                    // Kept apart from the rewrite above: a re-enabled monitor carries a run context
-                    // deliberately reset to the current checkpoints, and that reset has to reach the
-                    // index whether or not its queries changed. Writing when none of the three
-                    // applies would store the document unchanged, and its only effect would be to
-                    // move the sequence number a concurrent run's own write is conditional on.
+                    // Write only when something changed: every write makes a running monitor's checkpoint
+                    // write conflict.
                     if (isDocLevelMonitorRestarted || queriesChanged || runContextGainedIndices) {
                         MonitorMetadataService.upsertMetadata(updatedMetadata, updating = true)
                     }
