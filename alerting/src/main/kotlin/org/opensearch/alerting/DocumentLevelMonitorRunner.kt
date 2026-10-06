@@ -435,7 +435,7 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                     // have been percolated against none. Keep the old checkpoint so the next run
                     // reprocesses them with the new queries.
                     logger.warn(
-                        "Monitor ${monitor.id}: its queries were replaced while this run was in flight. " +
+                        "Monitor ${monitor.name} (${monitor.id}): its queries were replaced while this run was in flight. " +
                             "Discarding the run's checkpoint so the next run reprocesses the same documents."
                     )
                 } else {
@@ -481,7 +481,7 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
             val getRequest = GetRequest(ScheduledJob.SCHEDULED_JOBS_INDEX, monitor.id).routing(monitor.id)
             val getResponse: GetResponse = monitorCtx.client!!.suspendUntil { get(getRequest, it) }
             if (!getResponse.isExists) {
-                logger.warn("Monitor ${monitor.id}: no longer in the job index. Discarding this run's checkpoint.")
+                logger.warn("Monitor ${monitor.name} (${monitor.id}): no longer in the job index. Discarding this run's checkpoint.")
                 return true
             }
             val currentMonitor =
@@ -497,11 +497,14 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
             }
             changed
         } catch (e: Exception) {
-            logger.warn(
-                "Monitor ${monitor.id}: could not re-read the monitor to check whether its queries changed. " +
-                    "Discarding this run's checkpoint.",
-                e
-            )
+            val message = "Monitor ${monitor.name} (${monitor.id}): could not re-read the monitor to check whether its " +
+                "queries changed. Discarding this run's checkpoint."
+            if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away: expected during a restart.
+                logger.debug(message, e)
+            } else {
+                logger.warn(message, e)
+            }
             true
         }
     }
@@ -521,7 +524,15 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
             if (MonitorMetadataService.upsertMetadataUnlessConflicting(metadata) != null) {
                 return
             }
-            val current = MonitorMetadataService.getMetadata(monitor, workflowRunContext?.workflowMetadataId) ?: break
+            if (attempt == MAX_CHECKPOINT_WRITE_ATTEMPTS) {
+                break
+            }
+            val current = MonitorMetadataService.getMetadata(monitor, workflowRunContext?.workflowMetadataId)
+            if (current == null) {
+                val reason = "Monitor ${monitor.name} (${monitor.id}): could not store the run's checkpoint, " +
+                    "its metadata document no longer exists"
+                throw AlertingException(reason, RestStatus.NOT_FOUND, IllegalStateException(reason))
+            }
             // Keep the other writer's query index mapping, adding only the source indices this run registered.
             val mergedQueryIndexMapping = LinkedHashMap(current.sourceToQueryIndexMapping)
             metadata.sourceToQueryIndexMapping.forEach { (sourceIndex, queryIndex) ->
@@ -538,8 +549,8 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                 MAX_CHECKPOINT_WRITE_ATTEMPTS
             )
         }
-        val reason = "Monitor ${monitor.id}: could not store the run's checkpoint, the metadata document kept " +
-            "changing after $MAX_CHECKPOINT_WRITE_ATTEMPTS attempts"
+        val reason = "Monitor ${monitor.name} (${monitor.id}): could not store the run's checkpoint, the metadata document " +
+            "kept changing after $MAX_CHECKPOINT_WRITE_ATTEMPTS attempts"
         throw AlertingException(reason, RestStatus.CONFLICT, IllegalStateException(reason))
     }
 
