@@ -534,8 +534,9 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                 throw AlertingException(reason, RestStatus.NOT_FOUND, IllegalStateException(reason))
             }
             // Keep the other writer's query index mapping, adding only the source indices this run registered.
+            // Always from the run's own mapping, so a later attempt does not restore entries of an earlier one.
             val mergedQueryIndexMapping = LinkedHashMap(current.sourceToQueryIndexMapping)
-            metadata.sourceToQueryIndexMapping.forEach { (sourceIndex, queryIndex) ->
+            readMetadata.sourceToQueryIndexMapping.forEach { (sourceIndex, queryIndex) ->
                 mergedQueryIndexMapping.putIfAbsent(sourceIndex, queryIndex)
             }
             metadata = current.copy(
@@ -543,7 +544,8 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                 sourceToQueryIndexMapping = mergedQueryIndexMapping
             )
             logger.debug(
-                "Monitor {}: metadata moved under this run, merging and retrying the checkpoint write ({}/{})",
+                "Monitor {} ({}): metadata moved under this run, merging and retrying the checkpoint write ({}/{})",
+                monitor.name,
                 monitor.id,
                 attempt,
                 MAX_CHECKPOINT_WRITE_ATTEMPTS
