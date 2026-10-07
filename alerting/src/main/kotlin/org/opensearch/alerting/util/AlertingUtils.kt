@@ -24,6 +24,7 @@ import org.opensearch.common.xcontent.XContentType
 import org.opensearch.commons.alerting.model.AggregationResultBucket
 import org.opensearch.commons.alerting.model.BucketLevelTrigger
 import org.opensearch.commons.alerting.model.BucketLevelTriggerRunResult
+import org.opensearch.commons.alerting.model.DocLevelMonitorInput
 import org.opensearch.commons.alerting.model.DocumentLevelTrigger
 import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.ScheduledJob
@@ -457,11 +458,17 @@ fun isTransientFailure(e: Throwable): Boolean {
 
 /**
  * Returns true when updating [currentMonitor] to [updatedMonitor] changes its doc-level queries, that is,
- * its inputs or the query index they are written to. Shared by the update path, which only rewrites the
- * queries when this is true, and the monitor run, which discards its checkpoint when it is.
+ * the indices and queries of its inputs or the query index they are written to. An input's description
+ * is left out: Security Analytics sets it to the detector name, so a rename does not count. Shared by the
+ * update path, which only rewrites the queries when this is true, and the monitor run, which discards its
+ * checkpoint when it is.
  */
 fun docLevelQueriesChanged(currentMonitor: Monitor, updatedMonitor: Monitor): Boolean =
-    currentMonitor.inputs != updatedMonitor.inputs || currentMonitor.dataSources != updatedMonitor.dataSources
+    currentMonitor.queryInputs() != updatedMonitor.queryInputs() || currentMonitor.dataSources != updatedMonitor.dataSources
+
+/** The part of each input the doc-level queries are built from. */
+private fun Monitor.queryInputs(): List<Any> =
+    inputs.map { input -> (input as? DocLevelMonitorInput)?.let { it.indices to it.queries } ?: input }
 
 /**
  * Returns [monitor] as it reads back once stored, so it can be compared with a monitor parsed from the

@@ -278,10 +278,12 @@ object MonitorMetadataService :
             if (index == null) return mutableMapOf()
 
             val indices = mutableListOf<String>()
+            var backingIndices = emptyList<String>()
             if (IndexUtils.isAlias(index, clusterService.state()) ||
                 IndexUtils.isDataStream(index, clusterService.state())
             ) {
                 IndexUtils.getWriteIndex(index, clusterService.state())?.let { indices.add(it) }
+                backingIndices = clusterService.state().metadata.indicesLookup[index]?.indices?.map { it.index.name } ?: emptyList()
             } else {
                 val getIndexRequest = GetIndexRequest().indices(index)
                 val getIndexResponse: GetIndexResponse = client.suspendUntil {
@@ -292,7 +294,12 @@ object MonitorMetadataService :
 
             indices.forEach { indexName ->
                 if (!lastRunContext.containsKey(indexName)) {
-                    lastRunContext[indexName] = createRunContextForIndex(indexName)
+                    // On an update, a write index missing from a context that tracks an older index of the same
+                    // stream comes from a rollover no run has processed yet: start it from its first document, as
+                    // a run would. Any other new index starts at its current checkpoint.
+                    val rolledOver = existingRunContext != null &&
+                        backingIndices.any { it != indexName && lastRunContext.containsKey(it) }
+                    lastRunContext[indexName] = createRunContextForIndex(indexName, createdRecently = rolledOver)
                 }
             }
         } catch (e: RemoteTransportException) {

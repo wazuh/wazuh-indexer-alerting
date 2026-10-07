@@ -64,6 +64,22 @@ class RunCheckpointTests : OpenSearchTestCase() {
         assertTrue(docLevelQueriesChanged(monitor, monitor.copy(inputs = listOf(editedInput))))
     }
 
+    fun `test queries unchanged when only the input description or fan-out flag move`() {
+        // Security Analytics sets the input description to the detector name, so this is a detector rename.
+        val input = randomDocLevelMonitorInput()
+        val monitor = docLevelMonitor(input)
+        val renamed = monitor.copy(inputs = listOf(input.copy(description = input.description + "-renamed")))
+        assertFalse(docLevelQueriesChanged(monitor, renamed))
+        val fanOutToggled = monitor.copy(inputs = listOf(input.copy(fanoutEnabled = input.fanoutEnabled != true)))
+        assertFalse(docLevelQueriesChanged(monitor, fanOutToggled))
+    }
+
+    fun `test queries changed when the input indices change`() {
+        val input = randomDocLevelMonitorInput(indices = listOf("events-1"))
+        val monitor = docLevelMonitor(input)
+        assertTrue(docLevelQueriesChanged(monitor, monitor.copy(inputs = listOf(input.copy(indices = listOf("events-2"))))))
+    }
+
     fun `test queries changed when the query index moves`() {
         val monitor = docLevelMonitor(queryIndex = "query-index")
         assertTrue(docLevelQueriesChanged(monitor, monitor.copy(dataSources = DataSources(queryIndex = "other-query-index"))))
