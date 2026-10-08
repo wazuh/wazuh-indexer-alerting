@@ -46,6 +46,7 @@ import org.opensearch.core.xcontent.NamedXContentRegistry
 import org.opensearch.core.xcontent.ToXContent
 import org.opensearch.core.xcontent.XContentParser
 import org.opensearch.core.xcontent.XContentParserUtils
+import org.opensearch.index.engine.VersionConflictEngineException
 import org.opensearch.index.seqno.SequenceNumbers
 import org.opensearch.transport.RemoteTransportException
 import org.opensearch.transport.client.Client
@@ -77,56 +78,76 @@ object MonitorMetadataService :
         this.clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.INDEX_TIMEOUT) { indexTimeout = it }
     }
 
-    @Suppress("ComplexMethod", "ReturnCount")
     suspend fun upsertMetadata(metadata: MonitorMetadata, updating: Boolean): MonitorMetadata {
         try {
-            if (clusterService.state().routingTable.hasIndex(ScheduledJob.SCHEDULED_JOBS_INDEX)) {
-                val indexRequest = IndexRequest(ScheduledJob.SCHEDULED_JOBS_INDEX)
-                    .setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
-                    .source(
-                        metadata.toXContent(
-                            XContentFactory.jsonBuilder(),
-                            ToXContent.MapParams(mapOf("with_type" to "true"))
-                        )
-                    )
-                    .id(metadata.id)
-                    .routing(metadata.monitorId)
-                    .setIfSeqNo(metadata.seqNo)
-                    .setIfPrimaryTerm(metadata.primaryTerm)
-                    .timeout(indexTimeout)
-
-                if (updating) {
-                    indexRequest.id(metadata.id).setIfSeqNo(metadata.seqNo).setIfPrimaryTerm(metadata.primaryTerm)
-                } else {
-                    indexRequest.opType(DocWriteRequest.OpType.CREATE)
-                }
-                val response: IndexResponse = client.suspendUntil { index(indexRequest, it) }
-                when (response.result) {
-                    DocWriteResponse.Result.DELETED, DocWriteResponse.Result.NOOP, DocWriteResponse.Result.NOT_FOUND, null -> {
-                        val failureReason =
-                            "The upsert metadata call failed with a ${response.result?.lowercase} result"
-                        log.error(failureReason)
-                        throw AlertingException(
-                            failureReason,
-                            RestStatus.INTERNAL_SERVER_ERROR,
-                            IllegalStateException(failureReason)
-                        )
-                    }
-
-                    DocWriteResponse.Result.CREATED, DocWriteResponse.Result.UPDATED -> {
-                        log.debug("Successfully upserted MonitorMetadata:${metadata.id} ")
-                    }
-                }
-                return metadata.copy(
-                    seqNo = response.seqNo,
-                    primaryTerm = response.primaryTerm
-                )
-            } else {
-                val failureReason = "Job index ${ScheduledJob.SCHEDULED_JOBS_INDEX} does not exist to update monitor metadata"
-                throw OpenSearchStatusException(failureReason, RestStatus.INTERNAL_SERVER_ERROR)
-            }
+            return writeMetadata(metadata, updating)
         } catch (e: Exception) {
             throw AlertingException.wrap(e)
+        }
+    }
+
+    /**
+     * Like [upsertMetadata], but returns null on a version conflict instead of throwing, so a monitor
+     * run can merge and retry. The cause is unwrapped first, so a conflict coming from another node
+     * is recognised too.
+     */
+    suspend fun upsertMetadataUnlessConflicting(metadata: MonitorMetadata): MonitorMetadata? {
+        try {
+            return writeMetadata(metadata, updating = true)
+        } catch (e: Exception) {
+            if (ExceptionsHelper.unwrapCause(e) is VersionConflictEngineException) {
+                return null
+            }
+            throw AlertingException.wrap(e)
+        }
+    }
+
+    @Suppress("ComplexMethod", "ReturnCount")
+    private suspend fun writeMetadata(metadata: MonitorMetadata, updating: Boolean): MonitorMetadata {
+        if (clusterService.state().routingTable.hasIndex(ScheduledJob.SCHEDULED_JOBS_INDEX)) {
+            val indexRequest = IndexRequest(ScheduledJob.SCHEDULED_JOBS_INDEX)
+                .setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+                .source(
+                    metadata.toXContent(
+                        XContentFactory.jsonBuilder(),
+                        ToXContent.MapParams(mapOf("with_type" to "true"))
+                    )
+                )
+                .id(metadata.id)
+                .routing(metadata.monitorId)
+                .setIfSeqNo(metadata.seqNo)
+                .setIfPrimaryTerm(metadata.primaryTerm)
+                .timeout(indexTimeout)
+
+            if (updating) {
+                indexRequest.id(metadata.id).setIfSeqNo(metadata.seqNo).setIfPrimaryTerm(metadata.primaryTerm)
+            } else {
+                indexRequest.opType(DocWriteRequest.OpType.CREATE)
+            }
+            val response: IndexResponse = client.suspendUntil { index(indexRequest, it) }
+            when (response.result) {
+                DocWriteResponse.Result.DELETED, DocWriteResponse.Result.NOOP, DocWriteResponse.Result.NOT_FOUND, null -> {
+                    val failureReason =
+                        "The upsert metadata call failed with a ${response.result?.lowercase} result"
+                    log.error(failureReason)
+                    throw AlertingException(
+                        failureReason,
+                        RestStatus.INTERNAL_SERVER_ERROR,
+                        IllegalStateException(failureReason)
+                    )
+                }
+
+                DocWriteResponse.Result.CREATED, DocWriteResponse.Result.UPDATED -> {
+                    log.debug("Successfully upserted MonitorMetadata:${metadata.id} ")
+                }
+            }
+            return metadata.copy(
+                seqNo = response.seqNo,
+                primaryTerm = response.primaryTerm
+            )
+        } else {
+            val failureReason = "Job index ${ScheduledJob.SCHEDULED_JOBS_INDEX} does not exist to update monitor metadata"
+            throw OpenSearchStatusException(failureReason, RestStatus.INTERNAL_SERVER_ERROR)
         }
     }
 
@@ -257,10 +278,12 @@ object MonitorMetadataService :
             if (index == null) return mutableMapOf()
 
             val indices = mutableListOf<String>()
+            var backingIndices = emptyList<String>()
             if (IndexUtils.isAlias(index, clusterService.state()) ||
                 IndexUtils.isDataStream(index, clusterService.state())
             ) {
                 IndexUtils.getWriteIndex(index, clusterService.state())?.let { indices.add(it) }
+                backingIndices = clusterService.state().metadata.indicesLookup[index]?.indices?.map { it.index.name } ?: emptyList()
             } else {
                 val getIndexRequest = GetIndexRequest().indices(index)
                 val getIndexResponse: GetIndexResponse = client.suspendUntil {
@@ -271,7 +294,12 @@ object MonitorMetadataService :
 
             indices.forEach { indexName ->
                 if (!lastRunContext.containsKey(indexName)) {
-                    lastRunContext[indexName] = createRunContextForIndex(indexName)
+                    // On an update, a write index missing from a context that tracks an older index of the same
+                    // stream comes from a rollover no run has processed yet: start it from its first document, as
+                    // a run would. Any other new index starts at its current checkpoint.
+                    val rolledOver = existingRunContext != null &&
+                        backingIndices.any { it != indexName && lastRunContext.containsKey(it) }
+                    lastRunContext[indexName] = createRunContextForIndex(indexName, createdRecently = rolledOver)
                 }
             }
         } catch (e: RemoteTransportException) {

@@ -9,9 +9,15 @@ import org.apache.logging.log4j.LogManager
 import org.opensearch.ExceptionsHelper
 import org.opensearch.Version
 import org.opensearch.action.ActionListenerResponseHandler
+import org.opensearch.action.get.GetRequest
+import org.opensearch.action.get.GetResponse
 import org.opensearch.action.support.GroupedActionListener
+import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.util.IndexUtils
+import org.opensearch.alerting.util.ScheduledJobUtils
+import org.opensearch.alerting.util.docLevelQueriesChanged
 import org.opensearch.alerting.util.isNodeUnavailableFailure
+import org.opensearch.alerting.util.mergeRunCheckpoints
 import org.opensearch.cluster.metadata.IndexMetadata
 import org.opensearch.cluster.node.DiscoveryNode
 import org.opensearch.cluster.routing.ShardRouting
@@ -26,7 +32,9 @@ import org.opensearch.commons.alerting.model.DocumentLevelTriggerRunResult
 import org.opensearch.commons.alerting.model.IndexExecutionContext
 import org.opensearch.commons.alerting.model.InputRunResults
 import org.opensearch.commons.alerting.model.Monitor
+import org.opensearch.commons.alerting.model.MonitorMetadata
 import org.opensearch.commons.alerting.model.MonitorRunResult
+import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.model.WorkflowRunContext
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.core.action.ActionListener
@@ -48,6 +56,9 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlin.math.max
+
+/** How many times a run tries to store its checkpoint before failing. */
+private const val MAX_CHECKPOINT_WRITE_ATTEMPTS = 3
 
 open class DocumentLevelMonitorRunner : MonitorRunner() {
     private val logger = LogManager.getLogger(javaClass)
@@ -419,10 +430,17 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
             val triggerResults = buildTriggerResults(docLevelMonitorFanOutResponses)
             val inputRunResults = buildInputRunResults(docLevelMonitorFanOutResponses)
             if (!isTempMonitor) {
-                MonitorMetadataService.upsertMetadata(
-                    monitorMetadata.copy(lastRunContext = updatedLastRunContext),
-                    true
-                )
+                if (queriesChangedDuringRun(monitor, monitorCtx)) {
+                    // The queries were deleted and reindexed during this run, so some documents may
+                    // have been percolated against none. Keep the old checkpoint so the next run
+                    // reprocesses them with the new queries.
+                    logger.warn(
+                        "Monitor ${monitor.name} (${monitor.id}): its queries were replaced while this run was in flight. " +
+                            "Discarding the run's checkpoint so the next run reprocesses the same documents."
+                    )
+                } else {
+                    upsertRunCheckpoint(monitor, monitorMetadata, updatedLastRunContext, workflowRunContext)
+                }
             } else {
                 // Clean up any queries created by the dry run monitor
                 monitorCtx.docLevelMonitorQueries!!.deleteDocLevelQueriesOnDryRun(monitorMetadata)
@@ -451,6 +469,91 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                 totalTimeTakenStat
             )
         }
+    }
+
+    /**
+     * Re-reads the monitor and returns true if its queries changed since this run started, using the
+     * same check as the update path. A monitor that cannot be read counts as changed: reprocessing
+     * is safer than losing documents.
+     */
+    private suspend fun queriesChangedDuringRun(monitor: Monitor, monitorCtx: MonitorRunnerExecutionContext): Boolean {
+        return try {
+            val getRequest = GetRequest(ScheduledJob.SCHEDULED_JOBS_INDEX, monitor.id).routing(monitor.id)
+            val getResponse: GetResponse = monitorCtx.client!!.suspendUntil { get(getRequest, it) }
+            if (!getResponse.isExists) {
+                logger.warn("Monitor ${monitor.name} (${monitor.id}): no longer in the job index. Discarding this run's checkpoint.")
+                return true
+            }
+            val currentMonitor =
+                ScheduledJobUtils.parseMonitorFromScheduledJobDocSource(monitorCtx.xContentRegistry!!, getResponse)
+            val changed = docLevelQueriesChanged(monitor, currentMonitor)
+            if (changed) {
+                logger.debug(
+                    "Monitor {}: inputs changed: {}, data sources changed: {}",
+                    monitor.id,
+                    monitor.inputs != currentMonitor.inputs,
+                    monitor.dataSources != currentMonitor.dataSources
+                )
+            }
+            changed
+        } catch (e: Exception) {
+            val message = "Monitor ${monitor.name} (${monitor.id}): could not re-read the monitor to check whether its " +
+                "queries changed. Discarding this run's checkpoint."
+            if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away: expected during a restart.
+                logger.debug(message, e)
+            } else {
+                logger.warn(message, e)
+            }
+            true
+        }
+    }
+
+    /**
+     * Stores this run's checkpoint. If another writer updated the metadata in the meantime, re-reads
+     * it, merges the checkpoint into it and retries instead of failing the run.
+     */
+    private suspend fun upsertRunCheckpoint(
+        monitor: Monitor,
+        readMetadata: MonitorMetadata,
+        updatedLastRunContext: MutableMap<String, MutableMap<String, Any>>,
+        workflowRunContext: WorkflowRunContext?,
+    ) {
+        var metadata = readMetadata.copy(lastRunContext = updatedLastRunContext)
+        for (attempt in 1..MAX_CHECKPOINT_WRITE_ATTEMPTS) {
+            if (MonitorMetadataService.upsertMetadataUnlessConflicting(metadata) != null) {
+                return
+            }
+            if (attempt == MAX_CHECKPOINT_WRITE_ATTEMPTS) {
+                break
+            }
+            val current = MonitorMetadataService.getMetadata(monitor, workflowRunContext?.workflowMetadataId)
+            if (current == null) {
+                val reason = "Monitor ${monitor.name} (${monitor.id}): could not store the run's checkpoint, " +
+                    "its metadata document no longer exists"
+                throw AlertingException(reason, RestStatus.NOT_FOUND, IllegalStateException(reason))
+            }
+            // Keep the other writer's query index mapping, adding only the source indices this run registered.
+            // Always from the run's own mapping, so a later attempt does not restore entries of an earlier one.
+            val mergedQueryIndexMapping = LinkedHashMap(current.sourceToQueryIndexMapping)
+            readMetadata.sourceToQueryIndexMapping.forEach { (sourceIndex, queryIndex) ->
+                mergedQueryIndexMapping.putIfAbsent(sourceIndex, queryIndex)
+            }
+            metadata = current.copy(
+                lastRunContext = mergeRunCheckpoints(readMetadata.lastRunContext, updatedLastRunContext, current.lastRunContext),
+                sourceToQueryIndexMapping = mergedQueryIndexMapping
+            )
+            logger.debug(
+                "Monitor {} ({}): metadata moved under this run, merging and retrying the checkpoint write ({}/{})",
+                monitor.name,
+                monitor.id,
+                attempt,
+                MAX_CHECKPOINT_WRITE_ATTEMPTS
+            )
+        }
+        val reason = "Monitor ${monitor.name} (${monitor.id}): could not store the run's checkpoint, the metadata document " +
+            "kept changing after $MAX_CHECKPOINT_WRITE_ATTEMPTS attempts"
+        throw AlertingException(reason, RestStatus.CONFLICT, IllegalStateException(reason))
     }
 
     private fun updateLastRunContextFromFanOutResponses(

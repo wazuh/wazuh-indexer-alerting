@@ -31,5 +31,6 @@
 | [#1730](https://github.com/wazuh/wazuh-indexer/issues/1730) [#1731](https://github.com/wazuh/wazuh-indexer/issues/1731) | Fix errors from unresolved query index aliases and lock acquisition races during monitor runs |
 | [#1770](https://github.com/wazuh/wazuh-indexer/issues/1770) [#1867](https://github.com/wazuh/wazuh-indexer/issues/1867) | Fix node restarts being logged as errors and workflow alert failures being logged twice |
 | [#1577](https://github.com/wazuh/wazuh-indexer/issues/1577) | Fix SLF4J "no provider" warnings at startup |
+| [#1968](https://github.com/wazuh/wazuh-indexer/issues/1968) | Fix doc-level monitor runs being abandoned, or losing documents, when their detector is updated while they run |
 
 ## Prior versions

@@ -17,11 +17,17 @@ import org.opensearch.alerting.settings.DestinationSettings
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
 import org.opensearch.common.util.concurrent.ThreadContext
+import org.opensearch.common.xcontent.LoggingDeprecationHandler
+import org.opensearch.common.xcontent.XContentFactory
+import org.opensearch.common.xcontent.XContentHelper
+import org.opensearch.common.xcontent.XContentType
 import org.opensearch.commons.alerting.model.AggregationResultBucket
 import org.opensearch.commons.alerting.model.BucketLevelTrigger
 import org.opensearch.commons.alerting.model.BucketLevelTriggerRunResult
+import org.opensearch.commons.alerting.model.DocLevelMonitorInput
 import org.opensearch.commons.alerting.model.DocumentLevelTrigger
 import org.opensearch.commons.alerting.model.Monitor
+import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.model.Trigger
 import org.opensearch.commons.alerting.model.action.Action
 import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
@@ -29,8 +35,11 @@ import org.opensearch.commons.alerting.model.action.ActionExecutionScope
 import org.opensearch.commons.alerting.util.isBucketLevelMonitor
 import org.opensearch.commons.alerting.util.isMonitorOfStandardType
 import org.opensearch.core.common.breaker.CircuitBreakingException
+import org.opensearch.core.common.bytes.BytesReference
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException
 import org.opensearch.core.tasks.TaskCancelledException
+import org.opensearch.core.xcontent.NamedXContentRegistry
+import org.opensearch.core.xcontent.ToXContent
 import org.opensearch.index.IndexNotFoundException
 import org.opensearch.indices.IndexClosedException
 import org.opensearch.node.NodeClosedException
@@ -445,4 +454,84 @@ fun isTransientFailure(e: Throwable): Boolean {
         cause = if (next === cause) null else next
     }
     return false
+}
+
+/**
+ * Returns true when updating [currentMonitor] to [updatedMonitor] changes its doc-level queries, that is,
+ * the indices and queries of its inputs or the query index they are written to. An input's description
+ * is left out: Security Analytics sets it to the detector name, so a rename does not count. Shared by the
+ * update path, which only rewrites the queries when this is true, and the monitor run, which discards its
+ * checkpoint when it is.
+ */
+fun docLevelQueriesChanged(currentMonitor: Monitor, updatedMonitor: Monitor): Boolean =
+    currentMonitor.queryInputs() != updatedMonitor.queryInputs() || currentMonitor.dataSources != updatedMonitor.dataSources
+
+/** The part of each input the doc-level queries are built from. */
+private fun Monitor.queryInputs(): List<Any> =
+    inputs.map { input -> (input as? DocLevelMonitorInput)?.let { it.indices to it.queries } ?: input }
+
+/**
+ * Returns [monitor] as it reads back once stored, so it can be compared with a monitor parsed from the
+ * job index without serialization differences counting as changes.
+ */
+fun storedForm(monitor: Monitor, xContentRegistry: NamedXContentRegistry): Monitor {
+    val source = BytesReference.bytes(
+        monitor.toXContentWithUser(XContentFactory.jsonBuilder(), ToXContent.MapParams(mapOf("with_type" to "true")))
+    )
+    XContentHelper.createParser(xContentRegistry, LoggingDeprecationHandler.INSTANCE, source, XContentType.JSON).use { xcp ->
+        return ScheduledJob.parse(xcp, monitor.id, monitor.version) as Monitor
+    }
+}
+
+/**
+ * Merges the checkpoint a doc-level run produced ([ours]) into the one stored after another writer
+ * ([theirs]), given what the run read when it started ([base]):
+ *
+ * - indices in both keep the highest sequence number per shard;
+ * - indices only in [theirs] are added, unless the run dropped them on purpose (they are in [base]),
+ *   as it does with a data stream's previous write index after a rollover.
+ */
+fun mergeRunCheckpoints(base: Map<String, Any>, ours: Map<String, Any>, theirs: Map<String, Any>): Map<String, Any> {
+    val merged = LinkedHashMap<String, Any>(ours)
+    theirs.forEach { (indexName, theirCheckpoints) ->
+        val ourCheckpoints = merged[indexName]
+        if (ourCheckpoints == null) {
+            if (!base.containsKey(indexName)) {
+                merged[indexName] = theirCheckpoints
+            }
+            return@forEach
+        }
+        if (ourCheckpoints is Map<*, *> && theirCheckpoints is Map<*, *>) {
+            merged[indexName] = mergeShardCheckpoints(ourCheckpoints, theirCheckpoints)
+        }
+    }
+    return merged
+}
+
+/**
+ * Keeps the highest sequence number for each shard of one index. Non-numeric keys (`index`,
+ * `shards_count`) keep [ours].
+ */
+fun mergeShardCheckpoints(ours: Map<*, *>, theirs: Map<*, *>): MutableMap<String, Any> {
+    val merged = LinkedHashMap<String, Any>()
+    ours.forEach { (key, value) -> if (key is String && value != null) merged[key] = value }
+    theirs.forEach { (key, theirValue) ->
+        if (key !is String || theirValue == null) {
+            return@forEach
+        }
+        val ourValue = merged[key]
+        if (ourValue == null) {
+            merged[key] = theirValue
+            return@forEach
+        }
+        if (key.toIntOrNull() == null) {
+            return@forEach
+        }
+        val ourSeqNo = (ourValue as? Number)?.toLong()
+        val theirSeqNo = (theirValue as? Number)?.toLong()
+        if (ourSeqNo != null && theirSeqNo != null && theirSeqNo > ourSeqNo) {
+            merged[key] = theirValue
+        }
+    }
+    return merged
 }
