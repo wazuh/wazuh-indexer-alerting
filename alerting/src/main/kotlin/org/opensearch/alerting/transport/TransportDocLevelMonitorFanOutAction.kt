@@ -62,6 +62,7 @@ import org.opensearch.alerting.util.getActionExecutionPolicy
 import org.opensearch.alerting.util.getCancelAfterTimeInterval
 import org.opensearch.alerting.util.isActiveResponseMonitor
 import org.opensearch.alerting.util.isAllowed
+import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.alerting.util.isTestAction
 import org.opensearch.alerting.util.isTransientFailure
 import org.opensearch.alerting.util.parseSampleDocTags
@@ -410,11 +411,20 @@ class TransportDocLevelMonitorFanOutAction
                 "Completed fan_out for doc level monitor ${request.monitor.id} in $fanoutDuration ms. ExecutionId: ${request.executionId}"
             )
         } catch (e: Exception) {
-            log.error(
-                "${request.monitor.id} Failed to run fan_out on node ${clusterService.localNode().id}." +
-                    " for Monitor Type ${request.monitor.monitorType} ExecutionId ${request.executionId}",
-                e
-            )
+            if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away: the run is abandoned, not failed.
+                log.debug(
+                    "${request.monitor.id} fan_out on node ${clusterService.localNode().id} did not complete: node is closing." +
+                        " ExecutionId ${request.executionId}",
+                    e
+                )
+            } else {
+                log.error(
+                    "${request.monitor.id} Failed to run fan_out on node ${clusterService.localNode().id}." +
+                        " for Monitor Type ${request.monitor.monitorType} ExecutionId ${request.executionId}",
+                    e
+                )
+            }
             listener.onFailure(AlertingException.wrap(e))
         }
     }

@@ -484,6 +484,9 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     if (failureMessage?.contains("No field mapping can be found") == true) {
                         // Expected during WCS dynamic mapping bootstrap; resolves itself as data arrives.
                         log.debug(failureMessage)
+                    } else if (isNodeUnavailableFailure(bulkItemResponse.failure.cause)) {
+                        // The node is shutting down or a peer has gone away: the queries are indexed again on the next run.
+                        log.debug(failureMessage)
                     } else {
                         log.error(failureMessage)
                     }
@@ -620,6 +623,14 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                         throw AlertingException.wrap(e)
                     }
                 }
+            } else if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away. Rebuilding the query index cannot help: the run is
+                // abandoned and retried on the next schedule, not failed.
+                log.debug(
+                    "Doc level monitor ${monitor.id}: PUT mapping on queryIndex: $targetQueryIndex did not complete: node is closing",
+                    e
+                )
+                throw AlertingException.wrap(unwrappedException)
             } else {
                 // retry with deleting query index
                 if (monitor.deleteQueryIndexInEveryRun == true) {
@@ -646,11 +657,14 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                             indexTimeout = indexTimeout
                         )
                     } catch (e: Exception) {
-                        log.error(
-                            "Doc level monitor ${monitor.id}: unknown exception during " +
-                                "PUT mapping on queryIndex: $targetQueryIndex",
-                            e
-                        )
+                        val message = "Doc level monitor ${monitor.id}: unknown exception during " +
+                            "PUT mapping on queryIndex: $targetQueryIndex"
+                        if (isNodeUnavailableFailure(e)) {
+                            // The node closed while the query index was being rebuilt: the run is abandoned, not failed.
+                            log.debug(message, e)
+                        } else {
+                            log.error(message, e)
+                        }
                         val unwrappedException = ExceptionsHelper.unwrapCause(e) as Exception
                         throw AlertingException.wrap(unwrappedException)
                     }

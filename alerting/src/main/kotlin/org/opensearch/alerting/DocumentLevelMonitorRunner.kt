@@ -371,7 +371,15 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                                                             responseReader
                                                         ) {
                                                         override fun handleException(e: TransportException) {
-                                                            logger.error("Fan out retry failed in node ${localNode.id}", e)
+                                                            if (isNodeUnavailableFailure(e)) {
+                                                                // The node is shutting down: the run is abandoned, not failed.
+                                                                logger.debug(
+                                                                    "Fan out retry in node ${localNode.id} did not complete: node is closing",
+                                                                    e
+                                                                )
+                                                            } else {
+                                                                logger.error("Fan out retry failed in node ${localNode.id}", e)
+                                                            }
                                                             listener.onResponse(
                                                                 DocLevelMonitorFanOutResponse(
                                                                     "",
@@ -393,7 +401,12 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                                                     }
                                                 )
                                             } else {
-                                                logger.error("Fan out failed in node ${node.key}", e)
+                                                if (isNodeUnavailableFailure(e)) {
+                                                    // The node is shutting down or a peer has gone away: the run is abandoned, not failed.
+                                                    logger.debug("Fan out in node ${node.key} did not complete: node is closing", e)
+                                                } else {
+                                                    logger.error("Fan out failed in node ${node.key}", e)
+                                                }
                                                 listener.onResponse(
                                                     DocLevelMonitorFanOutResponse(
                                                         "",

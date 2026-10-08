@@ -8,6 +8,7 @@ package org.opensearch.alerting.util
 import org.mockito.Mockito.mock
 import org.opensearch.OpenSearchException
 import org.opensearch.Version
+import org.opensearch.action.bulk.BulkItemResponse
 import org.opensearch.action.search.SearchPhaseExecutionException
 import org.opensearch.action.search.ShardSearchFailure
 import org.opensearch.alerting.AlertService
@@ -25,6 +26,7 @@ import org.opensearch.alerting.script.DocumentLevelTriggerExecutionContext
 import org.opensearch.cluster.node.DiscoveryNode
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.unit.TimeValue
+import org.opensearch.commons.alerting.action.DocLevelMonitorFanOutAction
 import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
 import org.opensearch.commons.alerting.model.action.PerAlertActionScope
@@ -40,6 +42,7 @@ import org.opensearch.node.NodeClosedException
 import org.opensearch.test.OpenSearchTestCase
 import org.opensearch.transport.NodeNotConnectedException
 import org.opensearch.transport.RemoteTransportException
+import org.opensearch.transport.SendRequestTransportException
 import org.opensearch.transport.client.Client
 import java.io.IOException
 class AlertingUtilsTests : OpenSearchTestCase() {
@@ -292,6 +295,19 @@ class AlertingUtilsTests : OpenSearchTestCase() {
         // A shutdown seen through a transport hop arrives wrapped; the cause must still be recognised.
         val wrapped = RemoteTransportException("indices:admin/create", NodeClosedException(node()))
         assertTrue(isNodeUnavailableFailure(wrapped))
+    }
+
+    fun `test pending request failed by a stopping transport service is a node unavailable failure`() {
+        // TransportService.doStop() fails every request still in flight this way, which is what the doc-level
+        // monitor's fan-out handlers receive when the node stops mid-run.
+        val failed = SendRequestTransportException(node(), DocLevelMonitorFanOutAction.NAME, NodeClosedException(node()))
+        assertTrue(isNodeUnavailableFailure(failed))
+    }
+
+    fun `test bulk item failed by a closing node is a node unavailable failure`() {
+        // A shard bulk rerouted while the node closes fails every one of its items with NodeClosedException.
+        val failure = BulkItemResponse.Failure(".opensearch-sap-test-detectors-queries-000001", "id", NodeClosedException(node()))
+        assertTrue(isNodeUnavailableFailure(failure.cause))
     }
 
     fun `test genuine failure is not a node unavailable failure`() {
