@@ -28,6 +28,7 @@ import org.opensearch.alerting.util.CommentsUtils
 import org.opensearch.alerting.util.IndexUtils
 import org.opensearch.alerting.util.MAX_SEARCH_SIZE
 import org.opensearch.alerting.util.getBucketKeysHash
+import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.common.unit.TimeValue
 import org.opensearch.common.xcontent.LoggingDeprecationHandler
 import org.opensearch.common.xcontent.XContentFactory
@@ -589,7 +590,13 @@ class AlertService(
                 logger.debug("[${bulkResponse.items.size}] Error Alerts successfully cleared. End time set to: $currentTime")
             }
         } catch (e: Exception) {
-            logger.error("Error clearing monitor error alerts for monitor [${monitor.id}]: ${ExceptionsHelper.detailedMessage(e)}")
+            val message = "Error clearing monitor error alerts for monitor [${monitor.id}]: ${ExceptionsHelper.detailedMessage(e)}"
+            if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away: the alerts are cleared on the next successful run.
+                logger.debug(message)
+            } else {
+                logger.error(message)
+            }
         }
     }
 
@@ -671,7 +678,13 @@ class AlertService(
                 logger.error("Failed deleting alert while moving cleared alerts: [${it.id}] cause: [${it.cause}] ")
             }
         } catch (e: Exception) {
-            logger.error("Failed moving cleared error alerts to history index: ${ExceptionsHelper.detailedMessage(e)}")
+            val message = "Failed moving cleared error alerts to history index: ${ExceptionsHelper.detailedMessage(e)}"
+            if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away: the alerts are moved on the next successful run.
+                logger.debug(message)
+            } else {
+                logger.error(message)
+            }
         }
     }
 

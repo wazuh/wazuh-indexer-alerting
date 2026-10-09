@@ -5,7 +5,9 @@
 
 package org.opensearch.alerting.transport
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.apache.logging.log4j.LogManager
@@ -20,6 +22,7 @@ import org.opensearch.alerting.action.ExecuteWorkflowRequest
 import org.opensearch.alerting.action.ExecuteWorkflowResponse
 import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.alerting.util.use
+import org.opensearch.alerting.util.wrapKeepingNodeUnavailableCause
 import org.opensearch.common.inject.Inject
 import org.opensearch.common.xcontent.LoggingDeprecationHandler
 import org.opensearch.common.xcontent.XContentHelper
@@ -89,15 +92,17 @@ class TransportExecuteWorkflowAction @Inject constructor(
                             )
                         })
                     } catch (e: Exception) {
-                        if (isNodeUnavailableFailure(e)) {
-                            // The node is shutting down or a peer has gone away: the run is
-                            // abandoned and retried on the next schedule, not failed.
+                        if ((e is CancellationException && !isActive) || isNodeUnavailableFailure(e)) {
+                            // The node is shutting down -- MonitorRunnerService.doStop() cancels the runner's scope,
+                            // which is how this coroutine gets cancelled -- or a peer has gone away: the run is
+                            // abandoned and retried on the next schedule, not failed. A CancellationException
+                            // while the coroutine is still active comes from elsewhere and stays an error.
                             log.debug("Workflow ${workflow.id} did not complete: node is closing", e)
                         } else {
                             log.error("Error running workflow ${workflow.id}", e)
                         }
                         withContext(Dispatchers.IO) {
-                            actionListener.onFailure(AlertingException.wrap(e))
+                            actionListener.onFailure(wrapKeepingNodeUnavailableCause(e))
                         }
                     }
                 }
@@ -133,8 +138,13 @@ class TransportExecuteWorkflowAction @Inject constructor(
                         }
 
                         override fun onFailure(t: Exception) {
-                            log.error("Error getting workflow ${execWorkflowRequest.workflowId}", t)
-                            actionListener.onFailure(AlertingException.wrap(t))
+                            if (isNodeUnavailableFailure(t)) {
+                                // The node is shutting down or a peer has gone away: the run is abandoned, not failed.
+                                log.debug("Getting workflow ${execWorkflowRequest.workflowId} did not complete: node is closing", t)
+                            } else {
+                                log.error("Error getting workflow ${execWorkflowRequest.workflowId}", t)
+                            }
+                            actionListener.onFailure(wrapKeepingNodeUnavailableCause(t))
                         }
                     }
                 )

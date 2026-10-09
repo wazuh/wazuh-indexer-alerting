@@ -8,6 +8,7 @@ package org.opensearch.alerting.util
 import org.mockito.Mockito.mock
 import org.opensearch.OpenSearchException
 import org.opensearch.Version
+import org.opensearch.action.bulk.BulkItemResponse
 import org.opensearch.action.search.SearchPhaseExecutionException
 import org.opensearch.action.search.ShardSearchFailure
 import org.opensearch.alerting.AlertService
@@ -25,6 +26,7 @@ import org.opensearch.alerting.script.DocumentLevelTriggerExecutionContext
 import org.opensearch.cluster.node.DiscoveryNode
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.unit.TimeValue
+import org.opensearch.commons.alerting.action.DocLevelMonitorFanOutAction
 import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
 import org.opensearch.commons.alerting.model.action.PerAlertActionScope
@@ -40,6 +42,7 @@ import org.opensearch.node.NodeClosedException
 import org.opensearch.test.OpenSearchTestCase
 import org.opensearch.transport.NodeNotConnectedException
 import org.opensearch.transport.RemoteTransportException
+import org.opensearch.transport.SendRequestTransportException
 import org.opensearch.transport.client.Client
 import java.io.IOException
 class AlertingUtilsTests : OpenSearchTestCase() {
@@ -294,6 +297,19 @@ class AlertingUtilsTests : OpenSearchTestCase() {
         assertTrue(isNodeUnavailableFailure(wrapped))
     }
 
+    fun `test pending request failed by a stopping transport service is a node unavailable failure`() {
+        // TransportService.doStop() fails every request still in flight this way, which is what the doc-level
+        // monitor's fan-out handlers receive when the node stops mid-run.
+        val failed = SendRequestTransportException(node(), DocLevelMonitorFanOutAction.NAME, NodeClosedException(node()))
+        assertTrue(isNodeUnavailableFailure(failed))
+    }
+
+    fun `test bulk item failed by a closing node is a node unavailable failure`() {
+        // A shard bulk rerouted while the node closes fails every one of its items with NodeClosedException.
+        val failure = BulkItemResponse.Failure(".opensearch-sap-test-detectors-queries-000001", "id", NodeClosedException(node()))
+        assertTrue(isNodeUnavailableFailure(failure.cause))
+    }
+
     fun `test genuine failure is not a node unavailable failure`() {
         // An alert index that cannot be read is a real error and must keep error-level logging.
         assertFalse(isNodeUnavailableFailure(OpenSearchException("all shards failed")))
@@ -326,6 +342,31 @@ class AlertingUtilsTests : OpenSearchTestCase() {
         val converted = AlertingException.wrap(IllegalStateException("boom")) as Exception
 
         assertFalse(isNodeUnavailableFailure(converted))
+    }
+
+    fun `test node closed exception seen through a transport hop survives wrapKeepingNodeUnavailableCause`() {
+        // A GET on a closing node fails this way. Plain wrap() records only the transport wrapper, whose message
+        // is just the node, address and action, so the shutdown is lost for every caller above.
+        val failed = RemoteTransportException("indices:data/read/get[s]", NodeClosedException(node()))
+        assertFalse(isNodeUnavailableFailure(AlertingException.wrap(failed)))
+
+        assertTrue(isNodeUnavailableFailure(wrapKeepingNodeUnavailableCause(failed)))
+    }
+
+    fun `test wrapKeepingNodeUnavailableCause converts any other failure as wrap does`() {
+        val failed = RemoteTransportException("indices:data/read/get[s]", IllegalStateException("boom"))
+
+        val converted = wrapKeepingNodeUnavailableCause(failed)
+
+        assertEquals(AlertingException.wrap(failed).message, converted.message)
+        assertEquals(AlertingException.wrap(failed).cause?.message, converted.cause?.message)
+        assertFalse(isNodeUnavailableFailure(converted))
+    }
+
+    fun `test wrapKeepingNodeUnavailableCause leaves an already converted failure untouched`() {
+        val converted = AlertingException.wrap(NodeClosedException(node())) as Exception
+
+        assertSame(converted, wrapKeepingNodeUnavailableCause(converted))
     }
 
     /**

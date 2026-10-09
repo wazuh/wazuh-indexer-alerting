@@ -6,6 +6,8 @@
 package org.opensearch.alerting.util
 
 import org.apache.logging.log4j.LogManager
+import org.opensearch.ExceptionsHelper
+import org.opensearch.OpenSearchException
 import org.opensearch.action.search.SearchPhaseExecutionException
 import org.opensearch.alerting.AlertService
 import org.opensearch.alerting.MonitorRunnerService
@@ -32,6 +34,7 @@ import org.opensearch.commons.alerting.model.Trigger
 import org.opensearch.commons.alerting.model.action.Action
 import org.opensearch.commons.alerting.model.action.ActionExecutionPolicy
 import org.opensearch.commons.alerting.model.action.ActionExecutionScope
+import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.commons.alerting.util.isBucketLevelMonitor
 import org.opensearch.commons.alerting.util.isMonitorOfStandardType
 import org.opensearch.core.common.breaker.CircuitBreakingException
@@ -380,6 +383,23 @@ fun isNodeUnavailableFailure(e: Exception): Boolean {
         cause = if (next === cause) null else next
     }
     return false
+}
+
+/**
+ * `AlertingException.wrap()` that keeps a node-unavailable failure recognisable by [isNodeUnavailableFailure].
+ *
+ * `wrap()` records only the class name and message of the exception it is given. A shutdown seen through a
+ * transport hop arrives as a `RemoteTransportException` whose message is just the node, address and action, so
+ * wrapping it as is loses the `NodeClosedException` for every caller above. For such a failure the transport
+ * wrapper is unwrapped first; any other failure is converted exactly as `wrap()` would.
+ */
+fun wrapKeepingNodeUnavailableCause(e: Exception): OpenSearchException {
+    val cause = ExceptionsHelper.unwrapCause(e)
+    return if (cause !== e && cause is Exception && isNodeUnavailableFailure(cause)) {
+        AlertingException.wrap(cause)
+    } else {
+        AlertingException.wrap(e)
+    }
 }
 
 /**
