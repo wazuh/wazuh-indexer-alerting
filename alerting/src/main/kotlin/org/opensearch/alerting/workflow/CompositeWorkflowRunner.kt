@@ -18,6 +18,7 @@ import org.opensearch.alerting.script.ChainedAlertTriggerExecutionContext
 import org.opensearch.alerting.util.isDocLevelMonitor
 import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.alerting.util.isQueryLevelMonitor
+import org.opensearch.alerting.util.wrapKeepingNodeUnavailableCause
 import org.opensearch.cluster.routing.Preference
 import org.opensearch.common.xcontent.LoggingDeprecationHandler
 import org.opensearch.common.xcontent.XContentHelper
@@ -152,8 +153,13 @@ object CompositeWorkflowRunner : WorkflowRunner() {
                     )
                 resultList.add(delegateRunResult!!)
             } catch (ex: Exception) {
-                logger.error("Error executing workflow delegate monitor ${delegate.monitorId}", ex)
-                lastErrorDelegateRun = AlertingException.wrap(ex)
+                if (isNodeUnavailableFailure(ex)) {
+                    // The node is shutting down or a peer has gone away: the run is abandoned, not failed.
+                    logger.debug("Workflow delegate monitor ${delegate.monitorId} did not complete: node is closing", ex)
+                } else {
+                    logger.error("Error executing workflow delegate monitor ${delegate.monitorId}", ex)
+                }
+                lastErrorDelegateRun = wrapKeepingNodeUnavailableCause(ex)
                 break
             }
         }

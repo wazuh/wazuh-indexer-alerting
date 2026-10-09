@@ -463,10 +463,16 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
             return monitorResult.copy(triggerResults = triggerResults, inputResults = inputRunResults)
         } catch (e: Exception) {
             val errorMessage = ExceptionsHelper.detailedMessage(e)
-            if (false == dryrun) {
-                monitorCtx.alertService!!.upsertMonitorErrorAlert(monitor, errorMessage, executionId, workflowRunContext)
+            if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away: the run is abandoned, not failed, so it gets
+                // no error alert. Writing one would fail on a closing node anyway.
+                logger.debug("Document-level-monitor ${monitor.name} run did not complete: node is closing", e)
+            } else {
+                if (false == dryrun) {
+                    monitorCtx.alertService!!.upsertMonitorErrorAlert(monitor, errorMessage, executionId, workflowRunContext)
+                }
+                logger.error("Failed running Document-level-monitor ${monitor.name}", e)
             }
-            logger.error("Failed running Document-level-monitor ${monitor.name}", e)
             val alertingException = AlertingException(
                 errorMessage,
                 RestStatus.INTERNAL_SERVER_ERROR,

@@ -28,6 +28,7 @@ import org.opensearch.action.support.WriteRequest
 import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.alerting.util.IndexUtils
+import org.opensearch.alerting.util.wrapKeepingNodeUnavailableCause
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
 import org.opensearch.common.unit.TimeValue
@@ -82,7 +83,7 @@ object MonitorMetadataService :
         try {
             return writeMetadata(metadata, updating)
         } catch (e: Exception) {
-            throw AlertingException.wrap(e)
+            throw wrapKeepingNodeUnavailableCause(e)
         }
     }
 
@@ -98,7 +99,7 @@ object MonitorMetadataService :
             if (ExceptionsHelper.unwrapCause(e) is VersionConflictEngineException) {
                 return null
             }
-            throw AlertingException.wrap(e)
+            throw wrapKeepingNodeUnavailableCause(e)
         }
     }
 
@@ -180,7 +181,7 @@ object MonitorMetadataService :
                 }
             }
         } catch (e: Exception) {
-            throw AlertingException.wrap(e)
+            throw wrapKeepingNodeUnavailableCause(e)
         }
     }
 
@@ -218,7 +219,7 @@ object MonitorMetadataService :
             if (e.message?.contains("no such index") == true) {
                 return null
             } else {
-                throw AlertingException.wrap(e)
+                throw wrapKeepingNodeUnavailableCause(e)
             }
         }
     }
@@ -241,7 +242,7 @@ object MonitorMetadataService :
                 metadata
             }
         } catch (e: Exception) {
-            throw AlertingException.wrap(e)
+            throw wrapKeepingNodeUnavailableCause(e)
         }
     }
 

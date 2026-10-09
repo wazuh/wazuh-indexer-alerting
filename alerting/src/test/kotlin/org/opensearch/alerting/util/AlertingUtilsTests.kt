@@ -344,6 +344,31 @@ class AlertingUtilsTests : OpenSearchTestCase() {
         assertFalse(isNodeUnavailableFailure(converted))
     }
 
+    fun `test node closed exception seen through a transport hop survives wrapKeepingNodeUnavailableCause`() {
+        // A GET on a closing node fails this way. Plain wrap() records only the transport wrapper, whose message
+        // is just the node, address and action, so the shutdown is lost for every caller above.
+        val failed = RemoteTransportException("indices:data/read/get[s]", NodeClosedException(node()))
+        assertFalse(isNodeUnavailableFailure(AlertingException.wrap(failed)))
+
+        assertTrue(isNodeUnavailableFailure(wrapKeepingNodeUnavailableCause(failed)))
+    }
+
+    fun `test wrapKeepingNodeUnavailableCause converts any other failure as wrap does`() {
+        val failed = RemoteTransportException("indices:data/read/get[s]", IllegalStateException("boom"))
+
+        val converted = wrapKeepingNodeUnavailableCause(failed)
+
+        assertEquals(AlertingException.wrap(failed).message, converted.message)
+        assertEquals(AlertingException.wrap(failed).cause?.message, converted.cause?.message)
+        assertFalse(isNodeUnavailableFailure(converted))
+    }
+
+    fun `test wrapKeepingNodeUnavailableCause leaves an already converted failure untouched`() {
+        val converted = AlertingException.wrap(NodeClosedException(node())) as Exception
+
+        assertSame(converted, wrapKeepingNodeUnavailableCause(converted))
+    }
+
     /**
      * The shape a search cancelled by `SearchBackpressureService` reaches the doc-level monitor in: the
      * per-shard causes carry the cancellation, the top-level message is only "all shards failed", and
