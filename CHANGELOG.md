@@ -2,30 +2,35 @@
 
 ### Added
 
-- Initialize `wazuh-indexer-alerting` repository [(#1)](https://github.com/wazuh/wazuh-indexer-alerting/issues/1) [(#3)](https://github.com/wazuh/wazuh-indexer-alerting/issues/3)
-- Support Revert bump functionality in wazuh-indexer-alerting [(#19)](https://github.com/wazuh/wazuh-indexer-alerting/issues/19)
-- Implement dedicated monitor for Active Response [(#8)](https://github.com/wazuh/wazuh-indexer-alerting/issues/8)
-- Configurable resource creation limits [(#1276)](https://github.com/wazuh/wazuh-indexer-plugins/issues/1276)
+| Issue | Comment |
+|-------|---------|
+| [#1](https://github.com/wazuh/wazuh-indexer-alerting/issues/1) | Initialize `wazuh-indexer-alerting` repository |
+| [#4](https://github.com/wazuh/wazuh-indexer-alerting/issues/4) | Compatibility with OpenSearch 3.6.0 |
+| [#8](https://github.com/wazuh/wazuh-indexer-alerting/issues/8) | Add a dedicated active response monitor type |
+| [#1276](https://github.com/wazuh/wazuh-indexer-plugins/issues/1276) [#1420](https://github.com/wazuh/wazuh-indexer-plugins/issues/1420) | Add a configurable limit on the number of monitors (`plugins.alerting.monitor.max_monitors`) |
 
 ### Changed
 
-- Alerting logs review [(#7)](https://github.com/wazuh/wazuh-indexer-alerting/issues/7)
+| Issue | Comment |
+|-------|---------|
+| [#1274](https://github.com/wazuh/wazuh-indexer-plugins/issues/1274) | Disable alert history, finding history and comments by default |
+| [#1683](https://github.com/wazuh/wazuh-indexer/issues/1683) | Improve doc-level monitor performance by not forcing a findings index refresh per batch |
+| [#7](https://github.com/wazuh/wazuh-indexer-alerting/issues/7) | Reduce log noise from monitor creation and from queries over unmapped fields |
 
 ### Removed
 
--
+| Issue | Comment |
+|-------|---------|
 
 ### Fixed
-- RCA: missing findings [(#168)](https://github.com/wazuh/wazuh-indexer-security-analytics/issues/168)
-- SLF4J "no provider" warnings during startup [(#1577)](https://github.com/wazuh/wazuh-indexer/issues/1577)
-- java.lang.OutOfMemoryError: Java heap space in Soak agent tests [(#1746)](https://github.com/wazuh/wazuh-indexer/issues/1746)
-- Improve logs based on Analysis [(#1770)](https://github.com/wazuh/wazuh-indexer/issues/1770)
-- Fixed unresolved write-index alias errors in document-level monitors [(#1731)](https://github.com/wazuh/wazuh-indexer/issues/1731) [(#1730)](https://github.com/wazuh/wazuh-indexer/issues/1730)
-- Fix noisy error logs and workflow failures caused by lock acquisition race conditions [(#1730)](https://github.com/wazuh/wazuh-indexer/issues/1730)
-- Recognise an orderly node shutdown in the remaining alerting error paths instead of logging it as a failure [(#1867)](https://github.com/wazuh/wazuh-indexer/issues/1867) [(#1788)](https://github.com/wazuh/wazuh-indexer/issues/1788)
-- Doc-level monitors no longer skip documents when search backpressure cancels their percolate search [(#1876)](https://github.com/wazuh/wazuh-indexer/issues/1876)
-- Fix rules over a field that the source index does not map being silently dropped, which left missing-field detection unable to ever match [(#1518)](https://github.com/wazuh/wazuh-indexer-plugins/issues/1518)
-- Active Response monitors now send one response per matched event instead of one per run once a run exceeds `plugins.alerting.max_actionable_alert_count` or carries an error [(#1941)](https://github.com/wazuh/wazuh-indexer/issues/1941)
+
+| Issue | Comment |
+|-------|---------|
+| [#1518](https://github.com/wazuh/wazuh-indexer-plugins/issues/1518) | Fix rules over a field the source index does not map being silently dropped |
+| [#1746](https://github.com/wazuh/wazuh-indexer/issues/1746) | Fix a memory leak in doc-level monitors that exhausted the Java heap |
+| [#1730](https://github.com/wazuh/wazuh-indexer/issues/1730) [#1731](https://github.com/wazuh/wazuh-indexer/issues/1731) | Fix errors from unresolved query index aliases and lock acquisition races during monitor runs |
+| [#1770](https://github.com/wazuh/wazuh-indexer/issues/1770) [#1867](https://github.com/wazuh/wazuh-indexer/issues/1867) [#2003](https://github.com/wazuh/wazuh-indexer/issues/2003) | Fix node restarts being logged as errors and workflow alert failures being logged twice |
+| [#1577](https://github.com/wazuh/wazuh-indexer/issues/1577) | Fix SLF4J "no provider" warnings at startup |
+| [#1968](https://github.com/wazuh/wazuh-indexer/issues/1968) | Fix doc-level monitor runs being abandoned, or losing documents, when their detector is updated while they run |
 
 ## Prior versions
-- []()
