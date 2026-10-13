@@ -46,8 +46,10 @@ import org.opensearch.alerting.settings.DestinationSettings.Companion.ALLOW_LIST
 import org.opensearch.alerting.util.DocLevelMonitorQueries
 import org.opensearch.alerting.util.IndexUtils
 import org.opensearch.alerting.util.addUserBackendRolesFilter
+import org.opensearch.alerting.util.docLevelQueriesChanged
 import org.opensearch.alerting.util.getRoleFilterEnabled
 import org.opensearch.alerting.util.isADMonitor
+import org.opensearch.alerting.util.storedForm
 import org.opensearch.alerting.util.use
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.inject.Inject
@@ -785,21 +787,33 @@ class TransportIndexMonitorAction @Inject constructor(
                     Monitor.MonitorType.valueOf(currentMonitor.monitorType.uppercase(Locale.ROOT)) == Monitor.MonitorType.DOC_LEVEL_MONITOR
                 ) {
                     updatedMetadata = MonitorMetadataService.recreateRunContext(metadata, currentMonitor)
-                    if (docLevelMonitorQueries.docLevelQueryIndexExists(currentMonitor.dataSources)) {
-                        client.suspendUntil<Client, BulkByScrollResponse> {
-                            DeleteByQueryRequestBuilder(client, DeleteByQueryAction.INSTANCE)
-                                .source(currentMonitor.dataSources.queryIndex)
-                                .filter(QueryBuilders.matchQuery("monitor_id", currentMonitor.id))
-                                .execute(it)
+                    val runContextGainedIndices = updatedMetadata.lastRunContext != metadata.lastRunContext
+
+                    // Deleting and reindexing the queries is not atomic, so only do it when they changed.
+                    // The request is compared in its stored form, as a running monitor will compare it.
+                    val queriesChanged = docLevelQueriesChanged(currentMonitor, storedForm(request.monitor, xContentRegistry))
+                    if (queriesChanged) {
+                        if (docLevelMonitorQueries.docLevelQueryIndexExists(currentMonitor.dataSources)) {
+                            client.suspendUntil<Client, BulkByScrollResponse> {
+                                DeleteByQueryRequestBuilder(client, DeleteByQueryAction.INSTANCE)
+                                    .source(currentMonitor.dataSources.queryIndex)
+                                    .filter(QueryBuilders.matchQuery("monitor_id", currentMonitor.id))
+                                    .execute(it)
+                            }
                         }
+                        indexDocLevelMonitorQueries(
+                            request.monitor,
+                            currentMonitor.id,
+                            updatedMetadata,
+                            request.refreshPolicy
+                        )
                     }
-                    indexDocLevelMonitorQueries(
-                        request.monitor,
-                        currentMonitor.id,
-                        updatedMetadata,
-                        request.refreshPolicy
-                    )
-                    MonitorMetadataService.upsertMetadata(updatedMetadata, updating = true)
+
+                    // Write only when something changed: every write makes a running monitor's checkpoint
+                    // write conflict.
+                    if (isDocLevelMonitorRestarted || queriesChanged || runContextGainedIndices) {
+                        MonitorMetadataService.upsertMetadata(updatedMetadata, updating = true)
+                    }
                 }
                 actionListener.onResponse(
                     IndexMonitorResponse(
