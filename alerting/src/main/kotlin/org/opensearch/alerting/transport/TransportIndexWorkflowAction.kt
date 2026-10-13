@@ -587,7 +587,15 @@ class TransportIndexWorkflowAction @Inject constructor(
                         var updatedMetadata = MonitorMetadataService.recreateRunContext(monitorMetadata, monitor)
                         val oldMonitorMetadata = MonitorMetadataService.getMetadata(monitor)
                         updatedMetadata = updatedMetadata.copy(sourceToQueryIndexMapping = oldMonitorMetadata!!.sourceToQueryIndexMapping)
-                        MonitorMetadataService.upsertMetadata(updatedMetadata, updating = true)
+
+                        // Write only when something changed: every write moves the document's sequence
+                        // number and makes a running monitor's checkpoint write conflict.
+                        val metadataChanged = isWorkflowRestarted ||
+                            updatedMetadata.lastRunContext != monitorMetadata.lastRunContext ||
+                            updatedMetadata.sourceToQueryIndexMapping != monitorMetadata.sourceToQueryIndexMapping
+                        if (metadataChanged) {
+                            MonitorMetadataService.upsertMetadata(updatedMetadata, updating = true)
+                        }
                     }
                 }
                 actionListener.onResponse(

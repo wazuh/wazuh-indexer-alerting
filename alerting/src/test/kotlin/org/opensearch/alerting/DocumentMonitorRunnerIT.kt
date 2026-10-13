@@ -1846,6 +1846,59 @@ class DocumentMonitorRunnerIT : AlertingRestTestCase() {
         deleteDataStream(dataStreamName)
     }
 
+    fun `test document-level monitor updated after a datastream rollover evaluates the new write index from its first doc`() {
+        val dataStreamName = "test-datastream"
+        createDataStream(
+            dataStreamName,
+            """
+                "properties" : {
+                  "test_strict_date_time" : { "type" : "date", "format" : "strict_date_time" },
+                  "test_field" : { "type" : "keyword" },
+                  "number" : { "type" : "keyword" }
+                }
+            """.trimIndent(),
+            false
+        )
+
+        val docQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "3", fields = listOf())
+        val docLevelInput = DocLevelMonitorInput("description", listOf(dataStreamName), listOf(docQuery))
+        val monitor = createMonitor(
+            randomDocumentLevelMonitor(
+                inputs = listOf(docLevelInput),
+                triggers = listOf(randomDocumentLevelTrigger(condition = ALWAYS_RUN))
+            )
+        )
+
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        val testDoc = """{
+            "@timestamp": "$testTime",
+            "message" : "This is an error from IAD region",
+            "test_strict_date_time" : "$testTime",
+            "test_field" : "us-west-2"
+        }"""
+        indexDoc(dataStreamName, "1", testDoc)
+        var response = executeMonitor(monitor.id)
+        var output = entityAsMap(response)
+        var searchResult = (output.objectMap("input_results")["results"] as List<Map<String, Any>>).first()
+        @Suppress("UNCHECKED_CAST")
+        var matchingDocsToQuery = searchResult[docQuery.id] as List<String>
+        assertEquals("Incorrect search result", 1, matchingDocsToQuery.size)
+
+        // The update lands after the rollover and before the next run, so it is the first to see the new write index.
+        rolloverDatastream(dataStreamName)
+        indexDoc(dataStreamName, "2", testDoc)
+        updateMonitor(getMonitor(monitor.id), refresh = true)
+
+        response = executeMonitor(monitor.id)
+        output = entityAsMap(response)
+        searchResult = (output.objectMap("input_results")["results"] as List<Map<String, Any>>).first()
+        @Suppress("UNCHECKED_CAST")
+        matchingDocsToQuery = (searchResult[docQuery.id] as? List<String>).orEmpty()
+        assertEquals("Document indexed between the rollover and the update was skipped", 1, matchingDocsToQuery.size)
+
+        deleteDataStream(dataStreamName)
+    }
+
     fun `test document-level monitor when datastreams contain docs across read-only indices that do match query`() {
         val dataStreamName = "test-datastream"
         createDataStream(
