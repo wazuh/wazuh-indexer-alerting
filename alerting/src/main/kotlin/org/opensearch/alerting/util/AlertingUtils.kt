@@ -487,7 +487,7 @@ fun docLevelQueriesChanged(currentMonitor: Monitor, updatedMonitor: Monitor): Bo
     currentMonitor.queryInputs() != updatedMonitor.queryInputs() || currentMonitor.dataSources != updatedMonitor.dataSources
 
 /** The part of each input the doc-level queries are built from. */
-private fun Monitor.queryInputs(): List<Any> =
+internal fun Monitor.queryInputs(): List<Any> =
     inputs.map { input -> (input as? DocLevelMonitorInput)?.let { it.indices to it.queries } ?: input }
 
 /**
