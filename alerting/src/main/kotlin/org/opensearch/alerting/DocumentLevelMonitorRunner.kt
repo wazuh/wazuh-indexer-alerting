@@ -18,6 +18,7 @@ import org.opensearch.alerting.util.ScheduledJobUtils
 import org.opensearch.alerting.util.docLevelQueriesChanged
 import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.alerting.util.mergeRunCheckpoints
+import org.opensearch.alerting.util.queryInputs
 import org.opensearch.cluster.metadata.IndexMetadata
 import org.opensearch.cluster.node.DiscoveryNode
 import org.opensearch.cluster.routing.ShardRouting
@@ -443,15 +444,9 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
             val triggerResults = buildTriggerResults(docLevelMonitorFanOutResponses)
             val inputRunResults = buildInputRunResults(docLevelMonitorFanOutResponses)
             if (!isTempMonitor) {
-                if (queriesChangedDuringRun(monitor, monitorCtx)) {
-                    // The queries were deleted and reindexed during this run, so some documents may
-                    // have been percolated against none. Keep the old checkpoint so the next run
-                    // reprocesses them with the new queries.
-                    logger.warn(
-                        "Monitor ${monitor.name} (${monitor.id}): its queries were replaced while this run was in flight. " +
-                            "Discarding the run's checkpoint so the next run reprocesses the same documents."
-                    )
-                } else {
+                // Each reason to discard the checkpoint is reported where it is known, at the level
+                // it warrants. Only this run's own write is left to decide here.
+                if (!shouldDiscardCheckpoint(monitor, monitorCtx)) {
                     upsertRunCheckpoint(monitor, monitorMetadata, updatedLastRunContext, workflowRunContext)
                 }
             } else {
@@ -491,11 +486,11 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
     }
 
     /**
-     * Re-reads the monitor and returns true if its queries changed since this run started, using the
-     * same check as the update path. A monitor that cannot be read counts as changed: reprocessing
-     * is safer than losing documents.
+     * Re-reads the monitor and returns true if this run's checkpoint must be dropped: its queries
+     * changed, the monitor is gone, or it could not be read at all, which reprocesses rather than
+     * risk losing documents. Each case is logged here, where the reason is known.
      */
-    private suspend fun queriesChangedDuringRun(monitor: Monitor, monitorCtx: MonitorRunnerExecutionContext): Boolean {
+    private suspend fun shouldDiscardCheckpoint(monitor: Monitor, monitorCtx: MonitorRunnerExecutionContext): Boolean {
         return try {
             val getRequest = GetRequest(ScheduledJob.SCHEDULED_JOBS_INDEX, monitor.id).routing(monitor.id)
             val getResponse: GetResponse = monitorCtx.client!!.suspendUntil { get(getRequest, it) }
@@ -507,10 +502,15 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                 ScheduledJobUtils.parseMonitorFromScheduledJobDocSource(monitorCtx.xContentRegistry!!, getResponse)
             val changed = docLevelQueriesChanged(monitor, currentMonitor)
             if (changed) {
-                logger.debug(
-                    "Monitor {}: inputs changed: {}, data sources changed: {}",
+                // The designed outcome of an update landing inside a run: nothing is lost, the next
+                // run reprocesses the documents against the new queries.
+                logger.info(
+                    "Monitor {} ({}): its queries were replaced while this run was in flight " +
+                        "(queries or indices changed: {}, data sources changed: {}). " +
+                        "Discarding the run's checkpoint so the next run reprocesses the same documents.",
+                    monitor.name,
                     monitor.id,
-                    monitor.inputs != currentMonitor.inputs,
+                    monitor.queryInputs() != currentMonitor.queryInputs(),
                     monitor.dataSources != currentMonitor.dataSources
                 )
             }
