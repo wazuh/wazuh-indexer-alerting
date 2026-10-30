@@ -26,6 +26,7 @@
 
 | Issue | Comment |
 |-------|---------|
+| [#1876](https://github.com/wazuh/wazuh-indexer/issues/1876) | Fix doc-level monitors skipping documents when search backpressure cancels their percolate search |
 | [#1518](https://github.com/wazuh/wazuh-indexer-plugins/issues/1518) | Fix rules over a field the source index does not map being silently dropped |
 | [#1746](https://github.com/wazuh/wazuh-indexer/issues/1746) | Fix a memory leak in doc-level monitors that exhausted the Java heap |
 | [#1730](https://github.com/wazuh/wazuh-indexer/issues/1730) [#1731](https://github.com/wazuh/wazuh-indexer/issues/1731) | Fix errors from unresolved query index aliases and lock acquisition races during monitor runs |
