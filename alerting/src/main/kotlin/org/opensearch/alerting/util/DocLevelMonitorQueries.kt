@@ -407,7 +407,8 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         }
     }
 
-    private suspend fun doIndexAllQueries(
+    // Wazuh: internal, not private, so that DocLevelMonitorQueriesTests can check the queries it indexes.
+    internal suspend fun doIndexAllQueries(
         concreteQueryIndex: String,
         sourceIndex: String,
         monitorId: String,

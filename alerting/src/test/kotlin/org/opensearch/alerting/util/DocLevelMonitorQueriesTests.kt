@@ -5,9 +5,20 @@
 
 package org.opensearch.alerting.util
 
+import kotlinx.coroutines.runBlocking
+import org.mockito.ArgumentMatchers.any
+import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.mock
+import org.opensearch.action.bulk.BulkItemResponse
+import org.opensearch.action.bulk.BulkRequest
+import org.opensearch.action.bulk.BulkResponse
+import org.opensearch.action.index.IndexRequest
+import org.opensearch.action.support.WriteRequest.RefreshPolicy
 import org.opensearch.alerting.util.DocLevelMonitorQueries.Companion.ABSENT_FIELD_SENTINEL
 import org.opensearch.cluster.service.ClusterService
+import org.opensearch.common.unit.TimeValue
+import org.opensearch.commons.alerting.model.DocLevelQuery
+import org.opensearch.core.action.ActionListener
 import org.opensearch.test.OpenSearchTestCase
 import org.opensearch.transport.client.Client
 
@@ -74,5 +85,48 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
         val transformed = docLevelMonitorQueries.transformAbsentFieldQuery(query, docLevelMonitorQueries.fieldNamesIn(query))
 
         assertEquals("(\"QVLT1747MIX\") AND (NOT $ABSENT_FIELD_SENTINEL: \"nope\")", transformed)
+    }
+
+    fun `test doIndexAllQueries rewrites the unmapped fields of a query without field names`() {
+        // `keywords and not f`, with `f` on the unmapped `process.title`: Security Analytics sends no field names.
+        val mixed = DocLevelQuery("mixed", "mixed", emptyList(), "(\"QVLT1747MIX\") AND (NOT process.title: \"nope\")", emptyList(), emptyList())
+        // The same clause on a mapped field is renamed as before.
+        val mapped = DocLevelQuery("mapped", "mapped", emptyList(), "(\"QVLT1747MIX\") AND (NOT message: \"nope\")", emptyList(), emptyList())
+        // A query that carries field names is rewritten from those only.
+        val named = DocLevelQuery("named", "named", emptyList(), "(NOT process.title: \"nope\")", emptyList(), listOf("event.kind"))
+
+        val indexed = indexAllQueries(listOf(mixed, mapped, named), mutableSetOf(Pair("message", "idx")))
+
+        assertEquals(
+            mapOf(
+                "mixed_idx_mid" to "(\"QVLT1747MIX\") AND (NOT $ABSENT_FIELD_SENTINEL: \"nope\")",
+                "mapped_idx_mid" to "(\"QVLT1747MIX\") AND (NOT message_idx_mid: \"nope\")",
+                "named_idx_mid" to "(NOT process.title: \"nope\")"
+            ),
+            indexed
+        )
+    }
+
+    /** Runs doIndexAllQueries over source index `idx` and monitor `mid`, and gives the query indexed for each id. */
+    private fun indexAllQueries(queries: List<DocLevelQuery>, flattenPaths: MutableSet<Pair<String, String>>): Map<String, String> {
+        val client = mock(Client::class.java)
+        val requests = mutableListOf<BulkRequest>()
+        doAnswer { invocation ->
+            requests.add(invocation.getArgument(0))
+            invocation.getArgument<ActionListener<BulkResponse>>(1).onResponse(BulkResponse(arrayOf<BulkItemResponse>(), 0))
+            null
+        }.`when`(client).bulk(any(), any())
+
+        runBlocking {
+            DocLevelMonitorQueries(client, mock(ClusterService::class.java)).doIndexAllQueries(
+                "query-index", "idx", "mid", queries, flattenPaths, emptySet(), RefreshPolicy.NONE, TimeValue.timeValueSeconds(1)
+            )
+        }
+
+        return requests.single().requests().associate { request ->
+            @Suppress("UNCHECKED_CAST")
+            val queryString = ((request as IndexRequest).sourceAsMap()["query"] as Map<String, Map<String, Any>>)["query_string"]!!
+            request.id() to queryString["query"] as String
+        }
     }
 }
