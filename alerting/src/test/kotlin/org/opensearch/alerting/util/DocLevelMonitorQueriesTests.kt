@@ -50,4 +50,29 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
 
         assertEquals(query, docLevelMonitorQueries.transformAbsentFieldQuery(query, emptyList()))
     }
+
+    fun `test fieldNamesIn reads value and exists clauses`() {
+        val query = "(event.kind: \"event\") AND (NOT _exists_: user.name) AND (NOT process.title: \"nope\")"
+
+        assertEquals(setOf("event.kind", "user.name", "process.title"), docLevelMonitorQueries.fieldNamesIn(query))
+    }
+
+    fun `test fieldNamesIn finds no field in a keyword term`() {
+        assertEquals(emptySet<String>(), docLevelMonitorQueries.fieldNamesIn("\"DataError\" OR *Timeout*"))
+    }
+
+    fun `test fieldNamesIn skips colons inside quoted values, regular expressions and escapes`() {
+        val query = "(url.full: \"http://host:8080/a\") AND (file.path: /C:\\\\.*/) AND (message: a\\:b) AND \"k:v\""
+
+        assertEquals(setOf("url.full", "file.path", "message"), docLevelMonitorQueries.fieldNamesIn(query))
+    }
+
+    fun `test a query without field names gets its unmapped fields rewritten`() {
+        // A rule matching a keyword in any field and a field condition: `keywords and not f`.
+        val query = "(\"QVLT1747MIX\") AND (NOT process.title: \"nope\")"
+
+        val transformed = docLevelMonitorQueries.transformAbsentFieldQuery(query, docLevelMonitorQueries.fieldNamesIn(query))
+
+        assertEquals("(\"QVLT1747MIX\") AND (NOT $ABSENT_FIELD_SENTINEL: \"nope\")", transformed)
+    }
 }

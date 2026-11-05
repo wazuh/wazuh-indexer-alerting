@@ -73,6 +73,16 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
          * percolator can parse them (see [transformAbsentFieldQuery]).
          */
         const val ABSENT_FIELD_SENTINEL = "wazuh_absent_field_sentinel"
+
+        /** A quoted value, a regular expression or an escaped character of a `query_string` query. */
+        private val QUERY_LITERAL = Regex("\"(?:\\\\.|[^\"\\\\])*\"|/(?:\\\\.|[^/\\\\])*/|\\\\.")
+
+        /** A field name in a field position: `field:`. */
+        private val FIELD_BEFORE_COLON = Regex("(?<![\\w.@-])([\\w@][\\w.@-]*):")
+
+        /** The field of an `_exists_:field` clause. */
+        private val EXISTS_FIELD = Regex("_exists_:([\\w@][\\w.@-]*)")
+
         @JvmStatic
         fun docLevelQueriesMappings(): String {
             return DocLevelMonitorQueries::class.java.classLoader.getResource("mappings/doc-level-queries.json").readText()
@@ -427,6 +437,10 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         queries.forEach {
             val filteredConcreteIndices = mutableSetOf<String>()
             var query = it.query
+            // Wazuh: the fields the absent-field rewrite below checks. A query without field names, such
+            // as a Security Analytics rule that also matches a keyword in any field, still names fields
+            // in its text (wazuh/wazuh-indexer-plugins#1747). Read from the query before any rename.
+            val fieldNames = it.queryFieldNames.ifEmpty { fieldNamesIn(it.query).toList() }
             conflictingPaths.forEach { conflictingPath ->
                 if (query.contains(conflictingPath)) {
                     query = transformExistsQuery(query, conflictingPath, "<index>", monitorId)
@@ -439,12 +453,13 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                 filteredConcreteIndices.forEach { filteredConcreteIndex ->
                     val newQuery = it.copy(
                         id = "${it.id}_$filteredConcreteIndex",
-                        query = query.replace("<index>", filteredConcreteIndex)
+                        query = query.replace("<index>", filteredConcreteIndex),
+                        queryFieldNames = fieldNames
                     )
                     newQueries.add(newQuery)
                 }
             } else {
-                newQueries.add(it.copy(id = "${it.id}_$sourceIndex"))
+                newQueries.add(it.copy(id = "${it.id}_$sourceIndex", queryFieldNames = fieldNames))
             }
         }
 
@@ -543,6 +558,22 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             transformed = transformed.replace(Regex("(?<=_exists_:)$name(?![\\w.])"), ABSENT_FIELD_SENTINEL)
         }
         return transformed
+    }
+
+    /**
+     * Gives the field names a `query_string` query refers to: the names before a `:` and the names after
+     * `_exists_:`.
+     *
+     * Quoted values, regular expressions and escaped characters are skipped, so a `:` inside a matched
+     * value is not read as a field. A term with no field, such as `"DataError"`, names none.
+     */
+    internal fun fieldNamesIn(query: String): Set<String> {
+        val masked = query.replace(QUERY_LITERAL, " ").replace("_exists_: ", "_exists_:")
+        val names = mutableSetOf<String>()
+        FIELD_BEFORE_COLON.findAll(masked).forEach { names.add(it.groupValues[1]) }
+        EXISTS_FIELD.findAll(masked).forEach { names.add(it.groupValues[1]) }
+        names.remove("_exists_")
+        return names
     }
 
     private suspend fun updateQueryIndexMappings(
