@@ -13,6 +13,7 @@ import org.opensearch.action.index.IndexRequest
 import org.opensearch.action.index.IndexResponse
 import org.opensearch.action.update.UpdateRequest
 import org.opensearch.action.update.UpdateResponse
+import org.opensearch.cluster.metadata.IndexMetadata
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
 import org.opensearch.common.unit.TimeValue
@@ -306,7 +307,12 @@ class LockService(private val client: Client, private val clusterService: Cluste
             listener.onResponse(lockIndexReady())
         } else {
             val indexRequest = CreateIndexRequest(LOCK_INDEX_NAME).mapping(lockMapping())
-                .settings(Settings.builder().put("index.hidden", true).build())
+                .settings(
+                    Settings.builder()
+                        .put("index.hidden", true)
+                        .put(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS, "0-1")
+                        .build()
+                )
             client.admin().indices().create(
                 indexRequest,
                 object : ActionListener<CreateIndexResponse> {
