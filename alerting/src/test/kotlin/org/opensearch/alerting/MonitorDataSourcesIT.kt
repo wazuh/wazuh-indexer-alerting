@@ -24,15 +24,22 @@ import org.opensearch.action.bulk.BulkResponse
 import org.opensearch.action.fieldcaps.FieldCapabilitiesRequest
 import org.opensearch.action.index.IndexRequest
 import org.opensearch.action.search.SearchRequest
+import org.opensearch.action.support.PlainActionFuture
 import org.opensearch.action.support.WriteRequest
 import org.opensearch.alerting.alerts.AlertIndices
 import org.opensearch.alerting.core.ScheduledJobIndices
+import org.opensearch.alerting.core.lock.LockModel
+import org.opensearch.alerting.core.lock.LockService
+import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.alerting.transport.AlertingSingleNodeTestCase
 import org.opensearch.alerting.util.DocLevelMonitorQueries
 import org.opensearch.alerting.util.DocLevelMonitorQueries.Companion.INDEX_PATTERN_SUFFIX
 import org.opensearch.alerting.workflow.CompositeWorkflowRunner
 import org.opensearch.cluster.metadata.IndexMetadata
+import org.opensearch.cluster.metadata.Metadata
+import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
+import org.opensearch.common.unit.TimeValue
 import org.opensearch.common.xcontent.LoggingDeprecationHandler
 import org.opensearch.common.xcontent.XContentHelper
 import org.opensearch.common.xcontent.XContentType
@@ -6561,5 +6568,125 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         monitorMetadata = searchMonitorMetadata("${monitorResponse.id}-metadata")
         val lastRunContextAfterEnable = (monitorMetadata?.lastRunContext?.get(index) as? Map<String, Any>)
         assertEquals(3, lastRunContextAfterEnable?.get("0"))
+    }
+
+    // Every hidden index the plugin creates must keep a copy on another node, or losing the node that holds its
+    // primary turns the cluster red. `index.auto_expand_replicas: 0-1` gives no replica on a single node, which keeps
+    // it green, and one replica as soon as a second node joins. These tests live here because a second
+    // AlertingSingleNodeTestCase subclass breaks the node setup of the other one in the same test JVM.
+    fun `test indices of a monitor with Security Analytics data sources auto expand replicas`() {
+        val dataSources = DataSources(
+            queryIndex = ".opensearch-sap-test-detectors-queries",
+            alertsIndex = ".opensearch-sap-test-alerts",
+            alertsHistoryIndex = ".opensearch-sap-test-alerts-history",
+            alertsHistoryIndexPattern = "<.opensearch-sap-test-alerts-history-{now/d}-1>",
+            findingsIndex = ".opensearch-sap-test-findings",
+            findingsIndexPattern = "<.opensearch-sap-test-findings-{now/d}-1>"
+        )
+
+        createAndRunMonitor(index, dataSources)
+
+        val metadata = clusterMetadata()
+        assertAutoExpandReplicas(metadata, listOf(ScheduledJob.SCHEDULED_JOBS_INDEX, dataSources.alertsIndex))
+        assertAutoExpandReplicas(metadata, indicesBehind(metadata, dataSources.queryIndex))
+        assertAutoExpandReplicas(metadata, indicesBehind(metadata, dataSources.alertsHistoryIndex!!))
+        assertAutoExpandReplicas(metadata, indicesBehind(metadata, dataSources.findingsIndex))
+    }
+
+    fun `test default indices auto expand replicas after a rollover`() {
+        val rolloverSettings = listOf(
+            AlertingSettings.ALERT_HISTORY_ROLLOVER_PERIOD,
+            AlertingSettings.ALERT_HISTORY_INDEX_MAX_AGE,
+            AlertingSettings.FINDING_HISTORY_ROLLOVER_PERIOD,
+            AlertingSettings.FINDING_HISTORY_INDEX_MAX_AGE
+        ).map { it.key }
+        updateClusterSettings(Settings.builder().apply { rolloverSettings.forEach { put(it, "1s") } }.build())
+        try {
+            // A source index with close to 10000 mapped fields fills the query index, so the queries of the second
+            // monitor go to a new one created by a rollover.
+            val sourceIndex = "replicas_source_index"
+            createIndex(sourceIndex, Settings.builder().put("index.mapping.total_fields.limit", "10000").build())
+            val doc = StringBuilder("{")
+            for (i in 1..3300) {
+                doc.append(""" "id$i.somefield.somefield$i":$i,""")
+            }
+            doc.append("\"test_field\" : \"us-west-2\" }")
+            indexDoc(sourceIndex, "1", doc.toString())
+
+            createAndRunMonitor(sourceIndex, DataSources())
+            createAndRunMonitor(sourceIndex, DataSources())
+
+            assertTrue(
+                "the alert and finding history indices were not rolled over",
+                OpenSearchTestCase.waitUntil({
+                    val metadata = clusterMetadata()
+                    indicesBehind(metadata, AlertIndices.ALERT_HISTORY_ALL).size >= 2 &&
+                        indicesBehind(metadata, AlertIndices.FINDING_HISTORY_ALL).size >= 2
+                }, 30, TimeUnit.SECONDS)
+            )
+
+            val metadata = clusterMetadata()
+            val queryIndices = indicesBehind(metadata, ScheduledJob.DOC_LEVEL_QUERIES_INDEX + "*")
+            assertTrue(
+                "the query index was not rolled over: $queryIndices",
+                queryIndices.contains(ScheduledJob.DOC_LEVEL_QUERIES_INDEX + "-000002")
+            )
+            assertAutoExpandReplicas(metadata, queryIndices)
+            assertAutoExpandReplicas(metadata, listOf(AlertIndices.ALERT_INDEX))
+            assertAutoExpandReplicas(metadata, indicesBehind(metadata, AlertIndices.ALERT_HISTORY_ALL))
+            assertAutoExpandReplicas(metadata, indicesBehind(metadata, AlertIndices.FINDING_HISTORY_ALL))
+        } finally {
+            updateClusterSettings(Settings.builder().apply { rolloverSettings.forEach { putNull(it) } }.build())
+        }
+    }
+
+    fun `test lock index auto expands replicas`() {
+        val lockService = LockService(client(), getInstanceFromNode(ClusterService::class.java))
+        val lock = PlainActionFuture.newFuture<LockModel?>()
+
+        lockService.acquireLockWithId("internal-index-replicas", lock)
+        lock.actionGet(TimeValue.timeValueSeconds(30))
+
+        assertAutoExpandReplicas(clusterMetadata(), listOf(LockService.LOCK_INDEX_NAME))
+    }
+
+    private fun createAndRunMonitor(sourceIndex: String, dataSources: DataSources) {
+        val docQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "3", fields = listOf())
+        val monitor = randomDocumentLevelMonitor(
+            inputs = listOf(DocLevelMonitorInput("description", listOf(sourceIndex), listOf(docQuery))),
+            triggers = listOf(randomDocumentLevelTrigger(condition = ALWAYS_RUN)),
+            dataSources = dataSources
+        )
+        val monitorResponse = createMonitor(monitor)!!
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        indexDoc(sourceIndex, randomAlphaOfLength(10), """{ "test_strict_date_time": "$testTime", "test_field": "us-west-2" }""")
+        executeMonitor(monitorResponse.monitor, monitorResponse.id, false)
+    }
+
+    private fun clusterMetadata(): Metadata = client().admin().cluster().prepareState().get().state.metadata
+
+    /** Concrete indices of an index name, alias or wildcard pattern, including hidden ones. */
+    private fun indicesBehind(metadata: Metadata, expression: String): List<String> {
+        val regex = Regex(expression.split("*").joinToString(".*") { Regex.escape(it) })
+        return metadata.indicesLookup.filterKeys { regex.matches(it) }.values
+            .flatMap { abstraction -> abstraction.indices.map { it.index.name } }
+            .distinct()
+    }
+
+    private fun assertAutoExpandReplicas(metadata: Metadata, indices: List<String>) {
+        assertFalse("expected at least one index", indices.isEmpty())
+        indices.forEach { index ->
+            val indexMetadata = metadata.index(index)
+            assertNotNull("index [$index] does not exist", indexMetadata)
+            assertEquals(
+                "index.auto_expand_replicas of [$index]",
+                "0-1",
+                indexMetadata!!.settings.get(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS)
+            )
+        }
+    }
+
+    private fun updateClusterSettings(settings: Settings) {
+        client().admin().cluster().prepareUpdateSettings().setPersistentSettings(settings).get()
     }
 }
