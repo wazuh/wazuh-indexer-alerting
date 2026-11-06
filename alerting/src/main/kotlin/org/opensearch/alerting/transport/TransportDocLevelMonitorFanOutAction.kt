@@ -30,6 +30,7 @@ import org.opensearch.alerting.action.GetDestinationsAction
 import org.opensearch.alerting.action.GetDestinationsRequest
 import org.opensearch.alerting.action.GetDestinationsResponse
 import org.opensearch.alerting.commitPendingSeqNos
+import org.opensearch.alerting.describePercolateTruncation
 import org.opensearch.alerting.model.AlertContext
 import org.opensearch.alerting.model.destination.Destination
 import org.opensearch.alerting.model.destination.DestinationContextFactory
@@ -52,6 +53,7 @@ import org.opensearch.alerting.settings.AlertingSettings.Companion.MAX_ACTIONABL
 import org.opensearch.alerting.settings.AlertingSettings.Companion.PERCOLATE_QUERY_DOCS_SIZE_MEMORY_PERCENTAGE_LIMIT
 import org.opensearch.alerting.settings.AlertingSettings.Companion.PERCOLATE_QUERY_MAX_NUM_DOCS_IN_MEMORY
 import org.opensearch.alerting.settings.DestinationSettings
+import org.opensearch.alerting.util.MAX_SEARCH_SIZE
 import org.opensearch.alerting.util.defaultToPerExecutionAction
 import org.opensearch.alerting.util.destinationmigration.NotificationActionConfigs
 import org.opensearch.alerting.util.destinationmigration.NotificationApiUtils
@@ -1188,6 +1190,7 @@ class TransportDocLevelMonitorFanOutAction
             SearchRequest().indices(*queryIndices.toTypedArray()).preference(Preference.PRIMARY_FIRST.type())
         val searchSourceBuilder = SearchSourceBuilder()
         searchSourceBuilder.query(boolQueryBuilder)
+        searchSourceBuilder.size(MAX_SEARCH_SIZE)
         searchRequest.source(searchSourceBuilder)
         val cancelTimeout = getCancelAfterTimeInterval()
         if (cancelTimeout != -1L) {
@@ -1220,6 +1223,12 @@ class TransportDocLevelMonitorFanOutAction
         }
         log.debug("Monitor ${monitor.id} PERF_DEBUG: Percolate query time taken millis = ${response.took}")
         percolateQueriesTimeTakenStat += response.took.millis
+        describePercolateTruncation(response.hits)?.let { shortfall ->
+            log.warn(
+                "Monitor ${monitor.id}: percolate search for ${docs.size} document(s) of " +
+                    "[${concreteIndices.joinToString()}] $shortfall. The matches left out produce no findings in this run."
+            )
+        }
         return response.hits
     }
 
