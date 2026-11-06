@@ -4,8 +4,12 @@
  */
 package org.opensearch.alerting
 
+import org.apache.lucene.search.TotalHits
+import org.apache.lucene.search.TotalHits.Relation
 import org.opensearch.core.index.Index
 import org.opensearch.core.index.shard.ShardId
+import org.opensearch.search.SearchHit
+import org.opensearch.search.SearchHits
 import org.opensearch.test.OpenSearchTestCase
 
 class MonitorFanOutUtilsTests : OpenSearchTestCase() {
@@ -159,4 +163,36 @@ class MonitorFanOutUtilsTests : OpenSearchTestCase() {
         commitPendingSeqNos(pending) { _, _ -> fail("there was nothing to commit") }
         assertTrue(pending.isEmpty())
     }
+
+    fun `test a percolate search that returned every matched query is not reported`() {
+        assertNull(describePercolateTruncation(percolateHits(returned = 12, total = 12, Relation.EQUAL_TO)))
+    }
+
+    fun `test a percolate search with no match is not reported`() {
+        assertNull(describePercolateTruncation(percolateHits(returned = 0, total = 0, Relation.EQUAL_TO)))
+    }
+
+    fun `test a percolate search capped below its exact total is reported with both counts`() {
+        // 15 queries matched, but the search was sized for 10: five matches would produce no finding.
+        assertEquals(
+            "matched 15 queries but returned only 10",
+            describePercolateTruncation(percolateHits(returned = 10, total = 15, Relation.EQUAL_TO))
+        )
+    }
+
+    fun `test a percolate search whose total is only a lower bound is reported`() {
+        // Past the track_total_hits threshold the total stops counting, so it can equal the number returned.
+        assertEquals(
+            "matched more than the 10 queries it returned",
+            describePercolateTruncation(percolateHits(returned = 10, total = 10, Relation.GREATER_THAN_OR_EQUAL_TO))
+        )
+    }
+
+    fun `test a percolate search without a total is not reported`() {
+        val hits = SearchHits(Array(10) { SearchHit(it) }, null, 1.0f)
+        assertNull(describePercolateTruncation(hits))
+    }
+
+    private fun percolateHits(returned: Int, total: Long, relation: Relation): SearchHits =
+        SearchHits(Array(returned) { SearchHit(it) }, TotalHits(total, relation), 1.0f)
 }
