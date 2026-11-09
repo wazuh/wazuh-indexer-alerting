@@ -107,6 +107,24 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
         )
     }
 
+    fun `test doIndexAllQueries leaves metadata fields alone`() {
+        // Metadata fields are never mapped, but every document has them.
+        val id = DocLevelQuery("id", "id", emptyList(), "_id:*", emptyList(), emptyList())
+        val namedId = DocLevelQuery("named-id", "named-id", emptyList(), "_id:*", emptyList(), listOf("_id"))
+        val index = DocLevelQuery("index", "index", emptyList(), "_index:idx AND message:\"a\"", emptyList(), emptyList())
+
+        val indexed = indexAllQueries(listOf(id, namedId, index), mutableSetOf(Pair("message", "idx")))
+
+        assertEquals(
+            mapOf(
+                "id_idx_mid" to "_id:*",
+                "named-id_idx_mid" to "_id:*",
+                "index_idx_mid" to "_index:idx AND message_idx_mid:\"a\""
+            ),
+            indexed
+        )
+    }
+
     /** Runs doIndexAllQueries over source index `idx` and monitor `mid`, and gives the query indexed for each id. */
     private fun indexAllQueries(queries: List<DocLevelQuery>, flattenPaths: MutableSet<Pair<String, String>>): Map<String, String> {
         val client = mock(Client::class.java)

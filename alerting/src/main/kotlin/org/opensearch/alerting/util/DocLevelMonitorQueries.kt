@@ -50,6 +50,7 @@ import org.opensearch.index.query.QueryBuilders
 import org.opensearch.index.reindex.BulkByScrollResponse
 import org.opensearch.index.reindex.DeleteByQueryAction
 import org.opensearch.index.reindex.DeleteByQueryRequestBuilder
+import org.opensearch.indices.IndicesModule
 import org.opensearch.transport.client.Client
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -73,6 +74,12 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
          * percolator can parse them (see [transformAbsentFieldQuery]).
          */
         const val ABSENT_FIELD_SENTINEL = "wazuh_absent_field_sentinel"
+
+        /**
+         * Metadata fields such as `_id` and `_index`. No index maps them, yet they are present in every
+         * document, so the absent-field rewrite must leave them alone.
+         */
+        private val METADATA_FIELDS: Set<String> = IndicesModule.getBuiltInMetadataFields()
 
         /** A quoted value, a regular expression or an escaped character of a `query_string` query. */
         private val QUERY_LITERAL = Regex("\"(?:\\\\.|[^\"\\\\])*\"|/(?:\\\\.|[^/\\\\])*/|\\\\.")
@@ -474,7 +481,10 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     query = query.replace("${fieldPath.first}:", "${fieldPath.first}_${sourceIndex}_$monitorId:")
                 }
             }
-            query = transformAbsentFieldQuery(query, it.queryFieldNames.filterNot { f -> mappedPaths.contains(f) })
+            query = transformAbsentFieldQuery(
+                query,
+                it.queryFieldNames.filterNot { f -> mappedPaths.contains(f) || METADATA_FIELDS.contains(f) }
+            )
             val indexRequest = IndexRequest(concreteQueryIndex)
                 .id(it.id + "_$monitorId")
                 .source(
