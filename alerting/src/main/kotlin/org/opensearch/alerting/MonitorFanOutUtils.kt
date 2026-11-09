@@ -6,9 +6,11 @@ package org.opensearch.alerting
 
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
+import org.apache.lucene.search.TotalHits
 import org.opensearch.core.index.Index
 import org.opensearch.core.index.shard.ShardId
 import org.opensearch.index.seqno.SequenceNumbers
+import org.opensearch.search.SearchHits
 
 private val logger: Logger = LogManager.getLogger("FanOutEligibility")
 
@@ -26,6 +28,26 @@ private val logger: Logger = LogManager.getLogger("FanOutEligibility")
 fun commitPendingSeqNos(pendingSeqNos: MutableMap<String, Long>, commitSeqNo: (String, Long) -> Unit) {
     pendingSeqNos.forEach { (shard, seqNo) -> commitSeqNo(shard, seqNo) }
     pendingSeqNos.clear()
+}
+
+/**
+ * Describes how a doc-level monitor's percolate search fell short of returning every query it matched, or
+ * returns null when it returned all of them.
+ *
+ * Each hit of that search is a stored query that matched at least one document of the batch, and the search
+ * returns no more hits than its `size`. A match past that cap produces no finding, so the caller logs the
+ * shortfall instead of letting it go unnoticed. The total is exact up to the default `track_total_hits`
+ * threshold (10,000); past it the total is only a lower bound, which still means more matches than were
+ * returned.
+ */
+fun describePercolateTruncation(hits: SearchHits): String? {
+    val total = hits.totalHits ?: return null
+    val returned = hits.hits.size
+    return when {
+        total.relation == TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO -> "matched more than the $returned queries it returned"
+        total.value > returned -> "matched ${total.value} queries but returned only $returned"
+        else -> null
+    }
 }
 
 fun distributeShards(

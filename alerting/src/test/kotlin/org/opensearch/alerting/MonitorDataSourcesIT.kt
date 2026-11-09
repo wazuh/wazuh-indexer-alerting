@@ -414,8 +414,37 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
                 fields = listOf(),
                 queryFieldNames = listOf("alias.some.fff", "source.ip.v6.v1")
             )
+        val docQuery8 = DocLevelQuery(
+            query = "message:error",
+            name = "10",
+            fields = listOf()
+        )
+        val docQuery9 = DocLevelQuery(
+            query = "message:IAD",
+            name = "11",
+            fields = listOf()
+        )
+        val docQuery10 = DocLevelQuery(
+            query = "source.ip.v6.v1:[10000 TO 20000]",
+            name = "12",
+            fields = listOf()
+        )
+        val docQuery11 = DocLevelQuery(
+            query = "type.subtype:some",
+            name = "13",
+            fields = listOf()
+        )
+        val docQuery12 = DocLevelQuery(
+            query = "supertype.type:some",
+            name = "14",
+            fields = listOf()
+        )
         val docLevelInput = DocLevelMonitorInput(
-            "description", listOf(index), listOf(docQuery1, docQuery2, docQuery3, docQuery4, docQuery5, docQuery6, docQuery7)
+            "description", listOf(index),
+            listOf(
+                docQuery1, docQuery2, docQuery3, docQuery4, docQuery5, docQuery6, docQuery7,
+                docQuery8, docQuery9, docQuery10, docQuery11, docQuery12
+            )
         )
         val trigger = randomDocumentLevelTrigger(condition = ALWAYS_RUN)
         val customFindingsIndex = "custom_findings_index"
@@ -438,7 +467,7 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
             "source.ip.v6.v1" : 12345,
             "source.ip.v6.v2" : 16645,
             "source.ip.v4.v0" : 120,
-            "test_bad_char" : "\u0000", 
+            "test_bad_char" : "\u0000",
             "test_strict_date_time" : "$testTime",
             "test_field.some_other_field" : "us-west-2",
             "type.subtype" : "some subtype",
@@ -464,7 +493,56 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         val findings = searchFindings(id, customFindingsIndex)
         assertEquals("Findings saved for test monitor", 1, findings.size)
         assertTrue("Findings saved for test monitor", findings[0].relatedDocIds.contains("1"))
-        assertEquals("Didn't match all 7 queries", 7, findings[0].docLevelQueries.size)
+        assertEquals("Didn't match all 12 queries", 12, findings[0].docLevelQueries.size)
+    }
+
+    fun `test every document gets a finding when more than 10 queries match in one run`() {
+        // Each document matches exactly one query, so the run's percolate search has one hit per query. Left
+        // at its default size, that search returned only 10 hits, and the other documents got no finding.
+        val matchCount = 15
+        val docLevelInput = DocLevelMonitorInput(
+            "description", listOf(index),
+            (1..matchCount).map { n -> DocLevelQuery(query = "test_field_1:\"value_$n\"", name = "$n", fields = listOf()) }
+        )
+        val customFindingsIndex = "custom_findings_index"
+        var monitor = randomDocumentLevelMonitor(
+            inputs = listOf(docLevelInput),
+            triggers = listOf(randomDocumentLevelTrigger(condition = ALWAYS_RUN)),
+            dataSources = DataSources(
+                queryIndex = "custom_alerts_index",
+                findingsIndex = customFindingsIndex,
+                findingsIndexPattern = "custom_findings_index-1"
+            )
+        )
+        val monitorResponse = createMonitor(monitor)
+        assertFalse(monitorResponse?.id.isNullOrEmpty())
+        monitor = monitorResponse!!.monitor
+        val id = monitorResponse.id
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        (1..matchCount).forEach { n ->
+            indexDoc(index, "$n", """{ "test_field_1": "value_$n", "test_strict_date_time": "$testTime" }""")
+        }
+
+        val executeMonitorResponse = executeMonitor(monitor, id, false)
+        assertNull(executeMonitorResponse!!.monitorRunResult.error)
+        val matchedQueries = executeMonitorResponse.monitorRunResult.inputResults.results[0]
+        assertEquals("Not every matching query was returned by the percolate search", matchCount, matchedQueries.size)
+
+        // The shared search helpers fetch only 10 hits, so count with an explicit size.
+        refreshIndex(customFindingsIndex)
+        val findingsResponse = client().prepareSearch(customFindingsIndex)
+            .setSource(SearchSourceBuilder().size(100).query(TermQueryBuilder(Alert.MONITOR_ID_FIELD, id)))
+            .get()
+        assertEquals("Every document should have a finding", matchCount.toLong(), findingsResponse.hits.totalHits!!.value)
+        assertEquals(matchCount, findingsResponse.hits.hits.size)
+
+        val getAlertsResponse = client()
+            .execute(
+                AlertingActions.GET_ALERTS_ACTION_TYPE,
+                GetAlertsRequest(Table("asc", "id", null, 100, 0, ""), "ALL", "ALL", id, null)
+            )
+            .get()
+        assertEquals("Every document should have an alert", matchCount, getAlertsResponse.alerts.size)
     }
 
     fun `test percolate query failure when queryFieldNames has alias`() {
