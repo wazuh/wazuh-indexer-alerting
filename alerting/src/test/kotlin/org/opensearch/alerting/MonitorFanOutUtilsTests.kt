@@ -4,6 +4,7 @@
  */
 package org.opensearch.alerting
 
+import kotlinx.coroutines.runBlocking
 import org.apache.lucene.search.TotalHits
 import org.apache.lucene.search.TotalHits.Relation
 import org.opensearch.core.index.Index
@@ -195,4 +196,90 @@ class MonitorFanOutUtilsTests : OpenSearchTestCase() {
 
     private fun percolateHits(returned: Int, total: Long, relation: Relation): SearchHits =
         SearchHits(Array(returned) { SearchHit(it) }, TotalHits(total, relation), 1.0f)
+
+    fun `test one failing document costs only itself and a few searches`() {
+        val percolator = FakePercolator(failing = setOf(4321))
+
+        val isolation = isolate((0 until 50000).toList(), percolator)
+
+        assertEquals(listOf(4321), isolation.failing)
+        assertTrue(isolation.unresolved.isEmpty())
+        assertEquals("every other document is evaluated exactly once", (0 until 50000).toSet() - 4321, percolator.evaluatedOnce())
+        // Two searches per halving: the batch is split 16 times on the way down to the failing document.
+        assertTrue("took ${percolator.searches} searches", percolator.searches <= 2 * 16)
+    }
+
+    fun `test several failing documents are each isolated`() {
+        val percolator = FakePercolator(failing = setOf(0, 517, 518, 999))
+
+        val isolation = isolate((0 until 1000).toList(), percolator)
+
+        assertEquals(listOf(0, 517, 518, 999), isolation.failing)
+        assertTrue(isolation.unresolved.isEmpty())
+        assertEquals((0 until 1000).toSet() - setOf(0, 517, 518, 999), percolator.evaluatedOnce())
+    }
+
+    fun `test a failure that hits every document stops after the cap`() {
+        // Not a few bad values but a defect of the search itself: it must not cost a search per document.
+        val percolator = FakePercolator(failing = (0 until 50000).toSet())
+
+        val isolation = isolate((0 until 50000).toList(), percolator)
+
+        assertTrue(isolation.failing.size <= MAX_ISOLATED_PERCOLATE_FAILURES + 1)
+        assertEquals((0 until 50000).toList(), (isolation.failing + isolation.unresolved).sorted())
+        assertTrue("took ${percolator.searches} searches", percolator.searches <= 100)
+    }
+
+    fun `test a batch of one failing document needs no further search`() {
+        val percolator = FakePercolator(failing = setOf(7))
+
+        val isolation = isolate(listOf(7), percolator)
+
+        assertEquals(listOf(7), isolation.failing)
+        assertEquals(0, percolator.searches)
+    }
+
+    fun `test a failure no part reproduces leaves nothing out`() {
+        // The batch failed as a whole, but every half succeeds on its own.
+        val percolator = FakePercolator(failing = emptySet())
+
+        val isolation = isolate((0 until 100).toList(), percolator)
+
+        assertTrue(isolation.failing.isEmpty())
+        assertTrue(isolation.unresolved.isEmpty())
+        assertEquals((0 until 100).toSet(), percolator.evaluatedOnce())
+    }
+
+    fun `test a part refused for lack of resources is rethrown so the batch is deferred`() {
+        val percolator = FakePercolator(failing = setOf(10), transientAfter = 3)
+
+        expectThrows(IllegalStateException::class.java) { isolate((0 until 100).toList(), percolator) }
+    }
+
+    private fun isolate(docs: List<Int>, percolator: FakePercolator): PercolateIsolation<Int> = runBlocking {
+        percolateIsolatingFailures(docs, MAX_ISOLATED_PERCOLATE_FAILURES, { it is IllegalStateException }) {
+            percolator.percolate(it)
+        }
+    }
+
+    /**
+     * Fails any part holding a document of [failing], like a value the query index cannot hold, and every
+     * search past [transientAfter] with an exception the test classifies as transient.
+     */
+    private class FakePercolator(val failing: Set<Int>, val transientAfter: Int = Int.MAX_VALUE) {
+        var searches = 0
+        private val evaluated = mutableListOf<Int>()
+
+        fun percolate(part: List<Int>) {
+            searches++
+            if (searches > transientAfter) throw IllegalStateException("cancelled")
+            if (part.any { it in failing }) throw IllegalArgumentException("immense term")
+            evaluated += part
+        }
+
+        fun evaluatedOnce(): Set<Int> {
+            assertEquals("a document was evaluated twice", evaluated.size, evaluated.toSet().size)
+            return evaluated.toSet()
+        }
+    }
 }
