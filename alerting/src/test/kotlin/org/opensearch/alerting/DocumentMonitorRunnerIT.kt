@@ -3144,4 +3144,72 @@ class DocumentMonitorRunnerIT : AlertingRestTestCase() {
             assertEquals("Expected one action execution per alert, got messages $messages", 3, messages.toSet().size)
         }
     }
+
+    // Wazuh: scheduled runs keep the queries they indexed while those are current.
+    fun `test doc-level monitor runs index their queries again only when what they are built from changes`() {
+        // Each node keeps the queries it indexed, and a REST call can reach any node.
+        if (isMultiNode) return
+        val testIndex = createTestIndex()
+        val docQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "3", fields = listOf())
+        val docLevelInput = DocLevelMonitorInput("description", listOf(testIndex), listOf(docQuery))
+        val trigger = randomDocumentLevelTrigger(condition = ALWAYS_RUN)
+        val monitor = createMonitor(
+            randomDocumentLevelMonitor(inputs = listOf(docLevelInput), triggers = listOf(trigger), enabled = false)
+        )
+        // Only fields the index maps, so that indexing documents does not change its mapping.
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        val testDoc = """{ "test_strict_date_time" : "$testTime", "test_field" : "us-west-2" }"""
+
+        // The creation of the monitor indexed the query, but the first run cannot know it.
+        executeMonitor(monitor.id)
+        val indexed = queryDocSeqNo(monitor, docQuery, testIndex)
+        assertNotNull("The query is not in the query index", indexed)
+
+        executeMonitor(monitor.id)
+        assertEquals("A run indexed a query that had not changed", indexed, queryDocSeqNo(monitor, docQuery, testIndex))
+
+        indexDoc(testIndex, "1", testDoc)
+        assertEquals(listOf("1|$testIndex"), matchingDocs(executeMonitor(monitor.id), docQuery))
+        assertEquals("A run indexed a query that had not changed", indexed, queryDocSeqNo(monitor, docQuery, testIndex))
+
+        // A new field in the source mapping: the query is built again.
+        client().makeRequest(
+            "PUT", "/$testIndex/_mapping",
+            StringEntity("""{ "properties": { "new_field": { "type": "keyword" } } }""", ContentType.APPLICATION_JSON)
+        )
+        executeMonitor(monitor.id)
+        val afterMappingChange = queryDocSeqNo(monitor, docQuery, testIndex)
+        assertNotEquals("A run did not index the query after a mapping change", indexed, afterMappingChange)
+        executeMonitor(monitor.id)
+        assertEquals("A run indexed a query that had not changed", afterMappingChange, queryDocSeqNo(monitor, docQuery, testIndex))
+
+        // The query document is gone although nothing it is built from changed: it is indexed again.
+        adminClient().makeRequest(
+            "POST", "/${monitor.dataSources.queryIndex}/_delete_by_query?refresh=true",
+            StringEntity("""{ "query": { "match": { "monitor_id": "${monitor.id}" } } }""", ContentType.APPLICATION_JSON)
+        )
+        assertNull(queryDocSeqNo(monitor, docQuery, testIndex))
+        indexDoc(testIndex, "2", testDoc)
+        assertEquals(listOf("2|$testIndex"), matchingDocs(executeMonitor(monitor.id), docQuery))
+        assertNotNull("A run did not index the deleted query", queryDocSeqNo(monitor, docQuery, testIndex))
+    }
+
+    /** The sequence number of the document of [query] in the query index of [monitor], which changes with each write. */
+    private fun queryDocSeqNo(monitor: Monitor, query: DocLevelQuery, index: String): Long? {
+        val id = "${query.id}_${index}_${monitor.id}"
+        val response = try {
+            adminClient().makeRequest("GET", "/${monitor.dataSources.queryIndex}/_doc/$id")
+        } catch (e: ResponseException) {
+            if (e.response.restStatus() == RestStatus.NOT_FOUND) return null
+            throw e
+        }
+        return (entityAsMap(response)["_seq_no"] as Number).toLong()
+    }
+
+    private fun matchingDocs(response: Response, query: DocLevelQuery): List<String> {
+        @Suppress("UNCHECKED_CAST")
+        val results = (entityAsMap(response).objectMap("input_results")["results"] as List<Map<String, Any>>).first()
+        @Suppress("UNCHECKED_CAST")
+        return (results[query.id] as List<String>?).orEmpty()
+    }
 }
