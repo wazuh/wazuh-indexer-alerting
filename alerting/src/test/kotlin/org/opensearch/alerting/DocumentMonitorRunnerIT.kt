@@ -1479,7 +1479,10 @@ class DocumentMonitorRunnerIT : AlertingRestTestCase() {
         assertEquals("Search failed", RestStatus.OK, httpResponse.restStatus())
 
         val searchResponse = SearchResponse.fromXContent(createParser(JsonXContent.jsonXContent, httpResponse.entity.content))
-        searchResponse.hits.totalHits?.let { assertEquals(5L, it.value) }
+        // Wazuh: 6, not 5. The query on `source.device.hwd.id`, which test2 does not map, used to be rejected
+        // for test2. It is now indexed with the field rewritten to the absent-field sentinel, which never
+        // matches, so the findings above are the same (wazuh/wazuh-indexer-plugins#1747).
+        searchResponse.hits.totalHits?.let { assertEquals(6L, it.value) }
     }
 
     fun `test no of queries generated for document-level monitor based on wildcard indexes`() {
@@ -2501,7 +2504,10 @@ class DocumentMonitorRunnerIT : AlertingRestTestCase() {
         assertEquals("Search failed", RestStatus.OK, httpResponse.restStatus())
 
         val searchResponse = SearchResponse.fromXContent(createParser(JsonXContent.jsonXContent, httpResponse.entity.content))
-        searchResponse.hits.totalHits?.let { assertEquals(5L, it.value) }
+        // Wazuh: 6, not 5. The query on `source.device.hwd.id`, which test2 does not map, used to be rejected
+        // for test2. It is now indexed with the field rewritten to the absent-field sentinel, which never
+        // matches, so the findings above are the same (wazuh/wazuh-indexer-plugins#1747).
+        searchResponse.hits.totalHits?.let { assertEquals(6L, it.value) }
     }
 
     fun `test execute monitor with indices having fields with same name but different field mappings with NOT EQUALS`() {
