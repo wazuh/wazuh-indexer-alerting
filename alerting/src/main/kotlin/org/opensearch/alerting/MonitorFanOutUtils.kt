@@ -11,6 +11,7 @@ import org.opensearch.core.index.Index
 import org.opensearch.core.index.shard.ShardId
 import org.opensearch.index.seqno.SequenceNumbers
 import org.opensearch.search.SearchHits
+import kotlin.coroutines.cancellation.CancellationException
 
 private val logger: Logger = LogManager.getLogger("FanOutEligibility")
 
@@ -48,6 +49,70 @@ fun describePercolateTruncation(hits: SearchHits): String? {
         total.value > returned -> "matched ${total.value} queries but returned only $returned"
         else -> null
     }
+}
+
+/**
+ * How many failing documents [percolateIsolatingFailures] looks for in one batch. A failure that hits more
+ * documents than this is unlikely to come from a few values, so the search for them stops there to keep the
+ * cost of a bad batch bounded.
+ */
+const val MAX_ISOLATED_PERCOLATE_FAILURES = 10
+
+/**
+ * The outcome of [percolateIsolatingFailures]: [failing] holds the documents that fail on their own, and
+ * [unresolved] the ones left unevaluated once [MAX_ISOLATED_PERCOLATE_FAILURES] was reached. Every other
+ * document was evaluated.
+ */
+data class PercolateIsolation<T>(val failing: List<T>, val unresolved: List<T>)
+
+/**
+ * Evaluates [docs] in parts after the percolate search over all of them failed for a reason that is not
+ * transient, so that a document the query index cannot hold costs only itself instead of its whole batch.
+ *
+ * A failing part is split in halves, and each half is percolated on its own, until the failure is narrowed
+ * down to single documents. One failing document among `n` costs about `2 * log2(n)` searches, and every other
+ * document is evaluated exactly once. Once [maxFailing] documents have been isolated, a part that fails is
+ * given up whole instead of split again.
+ *
+ * [percolate] evaluates one part and throws when it fails. A failure that [isTransient] accepts is not a
+ * property of the documents, so it is rethrown: the caller defers the whole batch, as it does when the first
+ * search is refused.
+ *
+ * @param docs the batch, already known to fail as a whole.
+ */
+suspend fun <T> percolateIsolatingFailures(
+    docs: List<T>,
+    maxFailing: Int,
+    isTransient: (Exception) -> Boolean,
+    percolate: suspend (List<T>) -> Unit,
+): PercolateIsolation<T> {
+    val failing = mutableListOf<T>()
+    val unresolved = mutableListOf<T>()
+
+    suspend fun narrowDown(part: List<T>) {
+        if (part.size == 1) {
+            failing += part
+            return
+        }
+        if (failing.size >= maxFailing) {
+            unresolved += part
+            return
+        }
+        val middle = part.size / 2
+        for (half in listOf(part.subList(0, middle), part.subList(middle, part.size))) {
+            try {
+                percolate(half)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (isTransient(e)) throw e
+                narrowDown(half)
+            }
+        }
+    }
+
+    narrowDown(docs)
+    return PercolateIsolation(failing, unresolved)
 }
 
 fun distributeShards(

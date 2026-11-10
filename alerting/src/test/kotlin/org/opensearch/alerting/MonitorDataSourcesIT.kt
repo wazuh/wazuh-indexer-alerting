@@ -1360,6 +1360,57 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         Assert.assertTrue(mapping.toString().contains("\"analyzer\":\"$analyzer\""))
     }
 
+    fun `test a document the query index cannot hold costs only itself, not its batch`() {
+        // The `keyword` analyzer makes the query index copy of `message` a single term, and Lucene refuses a
+        // term longer than 32766 bytes. The percolate search over both documents fails because of the long one.
+        val docQuery = DocLevelQuery(query = "test_field_1:\"us-west-2\"", name = "3", fields = listOf())
+        val docLevelInput = DocLevelMonitorInput("description", listOf(index), listOf(docQuery))
+        val trigger = randomDocumentLevelTrigger(condition = ALWAYS_RUN)
+        var monitor = randomDocumentLevelMonitor(
+            inputs = listOf(docLevelInput),
+            triggers = listOf(trigger),
+            dataSources = DataSources(
+                queryIndex = "custom_query_index",
+                queryIndexMappingsByType = mapOf(Pair("text", mapOf(Pair("analyzer", "keyword")))),
+            )
+        )
+        val monitorResponse = createMonitor(monitor)
+        assertFalse(monitorResponse?.id.isNullOrEmpty())
+        monitor = monitorResponse!!.monitor
+        val id = monitorResponse.id
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        indexDoc(
+            index,
+            "long",
+            """{"message": "${"A".repeat(40000)}", "test_strict_date_time": "$testTime", "test_field_1": "us-west-2"}"""
+        )
+        indexDoc(
+            index,
+            "short",
+            """{"message": "This is an error from IAD region", "test_strict_date_time": "$testTime", "test_field_1": "us-west-2"}"""
+        )
+
+        val executeMonitorResponse = executeMonitor(monitor, id, false)
+
+        val docLevelTrigger = executeMonitorResponse!!.monitorRunResult.triggerResults.values.single() as DocumentLevelTriggerRunResult
+        assertEquals(
+            "the document percolated with the long one must still be evaluated",
+            listOf("short"),
+            docLevelTrigger.triggeredDocs.map { it.split("|")[0] }
+        )
+        val getAlertsResponse = client()
+            .execute(
+                AlertingActions.GET_ALERTS_ACTION_TYPE,
+                GetAlertsRequest(Table("asc", "id", null, 10, 0, ""), "ALL", "ALL", id, null)
+            )
+            .get()
+        val errorMessages = getAlertsResponse.alerts.mapNotNull { it.errorMessage }
+        assertTrue(
+            "only the long document is reported as not evaluated: $errorMessages",
+            errorMessages.any { it.contains("1 document(s) abandoned") }
+        )
+    }
+
     fun `test delete monitor deletes all queries and metadata too`() {
         val docQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "3", fields = listOf())
         val docLevelInput = DocLevelMonitorInput("description", listOf(index), listOf(docQuery))

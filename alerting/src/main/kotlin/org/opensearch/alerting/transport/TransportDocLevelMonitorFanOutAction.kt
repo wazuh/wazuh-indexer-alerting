@@ -24,6 +24,7 @@ import org.opensearch.action.search.SearchResponse
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
 import org.opensearch.alerting.AlertService
+import org.opensearch.alerting.MAX_ISOLATED_PERCOLATE_FAILURES
 import org.opensearch.alerting.MonitorRunnerService
 import org.opensearch.alerting.TriggerService
 import org.opensearch.alerting.action.GetDestinationsAction
@@ -38,6 +39,7 @@ import org.opensearch.alerting.opensearchapi.InjectorContextElement
 import org.opensearch.alerting.opensearchapi.convertToMap
 import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.opensearchapi.withClosableContext
+import org.opensearch.alerting.percolateIsolatingFailures
 import org.opensearch.alerting.script.DocumentLevelTriggerExecutionContext
 import org.opensearch.alerting.script.QueryLevelTriggerExecutionContext
 import org.opensearch.alerting.script.TriggerExecutionContext
@@ -1005,9 +1007,11 @@ class TransportDocLevelMonitorFanOutAction
      * the next run reads those documents again instead of stepping over them. That is the whole fix: the
      * batch used to be discarded while the shard had already been advanced past it.
      *
-     * Any other failure is treated as a defect rather than a shortage, and the batch is given up on: its
-     * sequence numbers are committed so the monitor keeps up with new documents instead of stalling on the
-     * same batch on every run. That is a real gap, so it is counted and reported.
+     * Any other failure is treated as a defect rather than a shortage. Such a defect is often a single
+     * document, for example a value too long for one term of the query index, so the batch is evaluated again
+     * in parts ([percolateInPartsAndCommitProgress]) and only the documents that fail on their own are given up
+     * on. Their sequence numbers are committed so the monitor keeps up with new documents instead of stalling on
+     * the same batch on every run. That is a real gap, so it is counted and reported.
      *
      * Failures are logged without a stack trace -- the message carries the monitor, the index, the document
      * count and the reason, which is what an operator needs -- and the count is also reported through the
@@ -1047,13 +1051,18 @@ class TransportDocLevelMonitorFanOutAction
                 )
                 return DetectionCoverageGap(deferredDocs = batchSize)
             }
-            log.error(
-                "Monitor ${monitor.id}: percolate search for $batchSize document(s) of " +
-                    "[${concreteIndices.joinToString()}] failed (${rootCauseMessage(e)}). " +
-                    "Those documents will not be evaluated by this monitor's queries."
+            return percolateInPartsAndCommitProgress(
+                e,
+                monitor,
+                monitorMetadata,
+                monitorInputIndices,
+                concreteIndices,
+                inputRunResults,
+                docsToQueries,
+                transformedDocs.toList(),
+                pendingSeqNos,
+                commitSeqNo
             )
-            commitPendingSeqNos(pendingSeqNos, commitSeqNo)
-            return DetectionCoverageGap(abandonedDocs = batchSize)
         } finally {
             // Sequence numbers still pending here were not evaluated, so they stay uncommitted and the
             // documents behind them are read again.
@@ -1061,6 +1070,75 @@ class TransportDocLevelMonitorFanOutAction
             transformedDocs.clear()
             docsSizeOfBatchInBytes = 0
         }
+    }
+
+    /**
+     * Evaluates [docs] in parts after their percolate search failed with [failure], which is not transient,
+     * then commits the pending sequence numbers and reports the documents that could not be evaluated.
+     *
+     * The matches of the parts are folded into the run results only once every part has been tried: when a
+     * part is refused for lack of resources the whole batch is deferred instead, and the documents already
+     * evaluated must not produce findings again on the next run.
+     */
+    private suspend fun percolateInPartsAndCommitProgress(
+        failure: Exception,
+        monitor: Monitor,
+        monitorMetadata: MonitorMetadata,
+        monitorInputIndices: List<String>,
+        concreteIndices: List<String>,
+        inputRunResults: MutableMap<String, MutableSet<String>>,
+        docsToQueries: MutableMap<String, MutableList<String>>,
+        docs: List<Pair<String, TransformedDocDto>>,
+        pendingSeqNos: MutableMap<String, Long>,
+        commitSeqNo: (String, Long) -> Unit
+    ): DetectionCoverageGap {
+        val batch = "percolate search for ${docs.size} document(s) of [${concreteIndices.joinToString()}] " +
+            "failed (${rootCauseMessage(failure)})"
+        val partRunResults = mutableMapOf<String, MutableSet<String>>()
+        val partDocsToQueries = mutableMapOf<String, MutableList<String>>()
+        val isolation = try {
+            percolateIsolatingFailures(docs, MAX_ISOLATED_PERCOLATE_FAILURES, ::isTransientFailure) { part ->
+                percolateDocsAndCollectHits(
+                    part.toMutableList(),
+                    monitor,
+                    monitorMetadata,
+                    monitorInputIndices,
+                    concreteIndices,
+                    partRunResults,
+                    partDocsToQueries
+                )
+            }
+        } catch (e: Exception) {
+            log.error(
+                "Monitor ${monitor.id}: $batch, and evaluating it in parts could not be completed " +
+                    "(${rootCauseMessage(e)}). Their sequence numbers stay uncommitted, so the next run evaluates " +
+                    "them again."
+            )
+            return DetectionCoverageGap(deferredDocs = docs.size)
+        }
+
+        partRunResults.forEach { (query, docIds) -> inputRunResults.getOrPut(query) { mutableSetOf() }.addAll(docIds) }
+        partDocsToQueries.forEach { (docId, queries) -> docsToQueries.getOrPut(docId) { mutableListOf() }.addAll(queries) }
+        commitPendingSeqNos(pendingSeqNos, commitSeqNo)
+
+        val skipped = isolation.failing.size + isolation.unresolved.size
+        if (skipped == 0) {
+            log.warn("Monitor ${monitor.id}: $batch, but every document was evaluated when the batch was split.")
+            return DetectionCoverageGap()
+        }
+        val failingDocs = isolation.failing.joinToString { "${it.second.concreteIndexName}/${it.first}" }
+        val unresolved = if (isolation.unresolved.isEmpty()) {
+            ""
+        } else {
+            " ${isolation.unresolved.size} more document(s) were not evaluated, because the search for the failing " +
+                "ones stops after $MAX_ISOLATED_PERCOLATE_FAILURES."
+        }
+        log.error(
+            "Monitor ${monitor.id}: $batch. Evaluated the batch in parts: ${isolation.failing.size} document(s) " +
+                "fail on their own and will not be evaluated by this monitor's queries: [$failingDocs].$unresolved " +
+                "The other ${docs.size - skipped} document(s) were evaluated."
+        )
+        return DetectionCoverageGap(abandonedDocs = skipped)
     }
 
     /** Runs the percolate query for [docs] and folds the queries it matched into the run results. */
