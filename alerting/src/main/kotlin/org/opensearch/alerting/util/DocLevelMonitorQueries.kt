@@ -49,6 +49,7 @@ import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.rest.RestStatus
 import org.opensearch.index.mapper.MapperService.INDEX_MAPPING_TOTAL_FIELDS_LIMIT_SETTING
+import org.opensearch.index.query.Operator
 import org.opensearch.index.query.QueryBuilders
 import org.opensearch.index.reindex.BulkByScrollResponse
 import org.opensearch.index.reindex.DeleteByQueryAction
@@ -310,6 +311,8 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         // Every source index of this monitor resolves the same queryIndex alias, so once the alias is known to
         // be unresolvable there is no point in paying the retry delay again for each remaining source index.
         val queryIndexResolver = QueryIndexWriteIndexResolver()
+        // Wazuh: the query documents of this monitor, once every source index has been handled, to delete the others.
+        val currentQueries = CurrentQueryDocs()
 
         // Run through each backing index and apply appropriate mappings to query index
         indices.forEach { indexName ->
@@ -338,6 +341,8 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                 reuseIndexedQueries &&
                 queriesAlreadyIndexed(monitor, monitorId, monitorMetadata, updatedIndexName, concreteIndices, clusterState)
             ) {
+                val indexed = indexedQueries.get(monitorId, updatedIndexName)!!
+                currentQueries.add(indexed.state.queryIndex, indexed.docIds)
                 return@forEach
             }
             val updatedProperties = mutableMapOf<String, Any>()
@@ -440,10 +445,80 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                 if (indexedDocs != null) {
                     val state = IndexedQueriesState.of(monitor, concreteIndices, concreteQueryIndex, indexedDocs.queryIndexUuid, clusterState)
                     indexedQueries.put(monitorId, updatedIndexName, IndexedQueries(state, indexedDocs.docIds))
+                    currentQueries.add(concreteQueryIndex, indexedDocs.docIds, indexed = true)
                 } else {
                     indexedQueries.remove(monitorId, updatedIndexName)
+                    currentQueries.unknown()
                 }
             }
+        }
+        // Wazuh: once the queries are indexed again, the documents of queries the monitor no longer lists go.
+        // Not when every source index was skipped, which keeps such a run free of index requests.
+        if (reuseIndexedQueries && currentQueries.complete && currentQueries.indexed) {
+            deleteUnlistedQueries(monitorId, currentQueries.queryIndices, currentQueries.docIds)
+        }
+    }
+
+    /** Wazuh: the query documents of a monitor that indexDocLevelQueries indexed or found current, by query index. */
+    private class CurrentQueryDocs {
+        val queryIndices = mutableSetOf<String>()
+        val docIds = mutableSetOf<String>()
+
+        /** False when the documents of a source index are not known, for example after a failed bulk item. */
+        var complete = true
+            private set
+
+        /** True when the queries of a source index were indexed by this call. */
+        var indexed = false
+            private set
+
+        fun add(queryIndex: String, ids: Set<String>, indexed: Boolean = false) {
+            queryIndices.add(queryIndex)
+            docIds.addAll(ids)
+            if (indexed) this.indexed = true
+        }
+
+        fun unknown() {
+            complete = false
+        }
+    }
+
+    /**
+     * Wazuh: deletes from [queryIndices] the query documents of [monitorId] other than [docIds].
+     *
+     * An update of a monitor deletes its query documents before indexing the new ones, but a run of the
+     * previous version still in flight can index the previous queries again after that, and runs only add
+     * documents. Those queries stayed for good, and a match of any of them failed every run
+     * (wazuh/wazuh-indexer#2105). A failure here is logged and leaves them for the next time. Internal, not
+     * private, for UnlistedQueriesTests.
+     */
+    internal suspend fun deleteUnlistedQueries(monitorId: String, queryIndices: Set<String>, docIds: Set<String>) {
+        if (queryIndices.isEmpty()) return
+        val unlisted = QueryBuilders.boolQuery()
+            .filter(QueryBuilders.matchQuery("monitor_id", monitorId).operator(Operator.AND))
+            .mustNot(QueryBuilders.idsQuery().addIds(*docIds.toTypedArray()))
+        try {
+            val response: BulkByScrollResponse = suspendCoroutine { cont ->
+                DeleteByQueryRequestBuilder(client, DeleteByQueryAction.INSTANCE)
+                    .source(*queryIndices.toTypedArray())
+                    .filter(unlisted)
+                    .refresh(true)
+                    .execute(
+                        object : ActionListener<BulkByScrollResponse> {
+                            override fun onResponse(response: BulkByScrollResponse) = cont.resume(response)
+                            override fun onFailure(t: Exception) = cont.resumeWithException(t)
+                        }
+                    )
+            }
+            if (response.deleted > 0) {
+                log.info("Monitor $monitorId: deleted ${response.deleted} query documents of queries it no longer lists from $queryIndices")
+            }
+            response.bulkFailures.forEach {
+                log.debug("Monitor $monitorId: could not delete the query document [${it.id}]: ${it.cause}")
+            }
+        } catch (e: Exception) {
+            val message = "Monitor $monitorId: could not delete the query documents of queries it no longer lists from $queryIndices"
+            if (isNodeUnavailableFailure(e)) log.debug(message, e) else log.warn(message, e)
         }
     }
 
