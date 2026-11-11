@@ -8,6 +8,7 @@ package org.opensearch.alerting.core
 import org.opensearch.action.admin.indices.create.CreateIndexRequest
 import org.opensearch.action.admin.indices.create.CreateIndexResponse
 import org.opensearch.cluster.health.ClusterIndexHealth
+import org.opensearch.cluster.metadata.IndexMetadata
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
 import org.opensearch.commons.alerting.model.ScheduledJob
@@ -38,7 +39,12 @@ class ScheduledJobIndices(private val client: AdminClient, private val clusterSe
         if (!scheduledJobIndexExists()) {
             var indexRequest = CreateIndexRequest(ScheduledJob.SCHEDULED_JOBS_INDEX)
                 .mapping(scheduledJobMappings())
-                .settings(Settings.builder().put("index.hidden", true).build())
+                .settings(
+                    Settings.builder()
+                        .put("index.hidden", true)
+                        .put(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS, "0-1")
+                        .build()
+                )
             client.indices().create(indexRequest, actionListener)
         }
     }
