@@ -7,13 +7,22 @@ package org.opensearch.alerting
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
 import org.apache.lucene.search.TotalHits
+import org.opensearch.alerting.util.isActiveResponseMonitor
+import org.opensearch.commons.alerting.model.DocLevelMonitorInput
+import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.core.index.Index
 import org.opensearch.core.index.shard.ShardId
+import org.opensearch.index.query.BoolQueryBuilder
+import org.opensearch.index.query.QueryBuilder
+import org.opensearch.index.query.QueryBuilders
+import org.opensearch.index.search.QueryParserHelper
 import org.opensearch.index.seqno.SequenceNumbers
 import org.opensearch.search.SearchHits
 import kotlin.coroutines.cancellation.CancellationException
 
 private val logger: Logger = LogManager.getLogger("FanOutEligibility")
+
+private const val ALL_FIELDS = "*"
 
 /**
  * Commits every shard sequence number held back in [pendingSeqNos], then clears them.
@@ -29,6 +38,56 @@ private val logger: Logger = LogManager.getLogger("FanOutEligibility")
 fun commitPendingSeqNos(pendingSeqNos: MutableMap<String, Long>, commitSeqNo: (String, Long) -> Unit) {
     pendingSeqNos.forEach { (shard, seqNo) -> commitSeqNo(shard, seqNo) }
     pendingSeqNos.clear()
+}
+
+/**
+ * Records that a shard has been read up to [maxSeqNo] when the documents left in that range need no
+ * evaluation, which is the case of a read narrowed by [matchFilterOf].
+ *
+ * With nothing waiting in the batch the sequence number is committed at once, and the one held back for the
+ * shard is dropped so that a later batch cannot commit a lower one over it. Otherwise it is held back like
+ * any other, and committed when the documents already read from the shard have been evaluated.
+ */
+fun markShardRead(
+    shard: String,
+    maxSeqNo: Long,
+    batchIsEmpty: Boolean,
+    pendingSeqNos: MutableMap<String, Long>,
+    commitSeqNo: (String, Long) -> Unit
+) {
+    if (batchIsEmpty) {
+        pendingSeqNos.remove(shard)
+        commitSeqNo(shard, maxSeqNo)
+    } else {
+        pendingSeqNos[shard] = maxSeqNo
+    }
+}
+
+/**
+ * Gives the filter that narrows the shard read of an Active Response monitor to the documents that match
+ * at least one of its queries, or null for any other monitor.
+ *
+ * A doc-level monitor reads every new document of its indices and percolates it against its queries. An
+ * Active Response monitor reads the findings data streams, where nearly every document matches none of its
+ * few queries, so that read is large for nothing: search backpressure cancels it on a node under pressure
+ * and the responses are late. Its queries are `query_string` queries written for the source index, so the
+ * index can apply them itself and return only the documents worth percolating.
+ *
+ * The clauses are built the way the queries are stored for percolation. Other doc-level monitors, such as
+ * the ones behind threat detectors, can carry thousands of queries and keep the full read.
+ */
+fun matchFilterOf(monitor: Monitor): QueryBuilder? {
+    if (!monitor.isActiveResponseMonitor()) return null
+    val queries = (monitor.inputs.firstOrNull() as? DocLevelMonitorInput)?.queries.orEmpty()
+    if (queries.isEmpty()) return null
+    val anyQuery = BoolQueryBuilder().minimumShouldMatch(1)
+    queries.forEach { query ->
+        val fields = query.fields.ifEmpty { listOf(ALL_FIELDS) }
+        anyQuery.should(
+            QueryBuilders.queryStringQuery(query.query).fields(QueryParserHelper.parseFieldsAndWeights(fields))
+        )
+    }
+    return anyQuery
 }
 
 /**
