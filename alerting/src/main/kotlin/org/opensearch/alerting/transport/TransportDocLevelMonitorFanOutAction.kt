@@ -24,12 +24,14 @@ import org.opensearch.action.search.SearchResponse
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
 import org.opensearch.alerting.AlertService
+import org.opensearch.alerting.MAX_ISOLATED_PERCOLATE_FAILURES
 import org.opensearch.alerting.MonitorRunnerService
 import org.opensearch.alerting.TriggerService
 import org.opensearch.alerting.action.GetDestinationsAction
 import org.opensearch.alerting.action.GetDestinationsRequest
 import org.opensearch.alerting.action.GetDestinationsResponse
 import org.opensearch.alerting.commitPendingSeqNos
+import org.opensearch.alerting.describePercolateTruncation
 import org.opensearch.alerting.model.AlertContext
 import org.opensearch.alerting.model.destination.Destination
 import org.opensearch.alerting.model.destination.DestinationContextFactory
@@ -37,6 +39,7 @@ import org.opensearch.alerting.opensearchapi.InjectorContextElement
 import org.opensearch.alerting.opensearchapi.convertToMap
 import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.opensearchapi.withClosableContext
+import org.opensearch.alerting.percolateIsolatingFailures
 import org.opensearch.alerting.script.DocumentLevelTriggerExecutionContext
 import org.opensearch.alerting.script.QueryLevelTriggerExecutionContext
 import org.opensearch.alerting.script.TriggerExecutionContext
@@ -52,6 +55,7 @@ import org.opensearch.alerting.settings.AlertingSettings.Companion.MAX_ACTIONABL
 import org.opensearch.alerting.settings.AlertingSettings.Companion.PERCOLATE_QUERY_DOCS_SIZE_MEMORY_PERCENTAGE_LIMIT
 import org.opensearch.alerting.settings.AlertingSettings.Companion.PERCOLATE_QUERY_MAX_NUM_DOCS_IN_MEMORY
 import org.opensearch.alerting.settings.DestinationSettings
+import org.opensearch.alerting.util.MAX_SEARCH_SIZE
 import org.opensearch.alerting.util.defaultToPerExecutionAction
 import org.opensearch.alerting.util.destinationmigration.NotificationActionConfigs
 import org.opensearch.alerting.util.destinationmigration.NotificationApiUtils
@@ -1003,9 +1007,11 @@ class TransportDocLevelMonitorFanOutAction
      * the next run reads those documents again instead of stepping over them. That is the whole fix: the
      * batch used to be discarded while the shard had already been advanced past it.
      *
-     * Any other failure is treated as a defect rather than a shortage, and the batch is given up on: its
-     * sequence numbers are committed so the monitor keeps up with new documents instead of stalling on the
-     * same batch on every run. That is a real gap, so it is counted and reported.
+     * Any other failure is treated as a defect rather than a shortage. Such a defect is often a single
+     * document, for example a value too long for one term of the query index, so the batch is evaluated again
+     * in parts ([percolateInPartsAndCommitProgress]) and only the documents that fail on their own are given up
+     * on. Their sequence numbers are committed so the monitor keeps up with new documents instead of stalling on
+     * the same batch on every run. That is a real gap, so it is counted and reported.
      *
      * Failures are logged without a stack trace -- the message carries the monitor, the index, the document
      * count and the reason, which is what an operator needs -- and the count is also reported through the
@@ -1045,13 +1051,18 @@ class TransportDocLevelMonitorFanOutAction
                 )
                 return DetectionCoverageGap(deferredDocs = batchSize)
             }
-            log.error(
-                "Monitor ${monitor.id}: percolate search for $batchSize document(s) of " +
-                    "[${concreteIndices.joinToString()}] failed (${rootCauseMessage(e)}). " +
-                    "Those documents will not be evaluated by this monitor's queries."
+            return percolateInPartsAndCommitProgress(
+                e,
+                monitor,
+                monitorMetadata,
+                monitorInputIndices,
+                concreteIndices,
+                inputRunResults,
+                docsToQueries,
+                transformedDocs.toList(),
+                pendingSeqNos,
+                commitSeqNo
             )
-            commitPendingSeqNos(pendingSeqNos, commitSeqNo)
-            return DetectionCoverageGap(abandonedDocs = batchSize)
         } finally {
             // Sequence numbers still pending here were not evaluated, so they stay uncommitted and the
             // documents behind them are read again.
@@ -1059,6 +1070,75 @@ class TransportDocLevelMonitorFanOutAction
             transformedDocs.clear()
             docsSizeOfBatchInBytes = 0
         }
+    }
+
+    /**
+     * Evaluates [docs] in parts after their percolate search failed with [failure], which is not transient,
+     * then commits the pending sequence numbers and reports the documents that could not be evaluated.
+     *
+     * The matches of the parts are folded into the run results only once every part has been tried: when a
+     * part is refused for lack of resources the whole batch is deferred instead, and the documents already
+     * evaluated must not produce findings again on the next run.
+     */
+    private suspend fun percolateInPartsAndCommitProgress(
+        failure: Exception,
+        monitor: Monitor,
+        monitorMetadata: MonitorMetadata,
+        monitorInputIndices: List<String>,
+        concreteIndices: List<String>,
+        inputRunResults: MutableMap<String, MutableSet<String>>,
+        docsToQueries: MutableMap<String, MutableList<String>>,
+        docs: List<Pair<String, TransformedDocDto>>,
+        pendingSeqNos: MutableMap<String, Long>,
+        commitSeqNo: (String, Long) -> Unit
+    ): DetectionCoverageGap {
+        val batch = "percolate search for ${docs.size} document(s) of [${concreteIndices.joinToString()}] " +
+            "failed (${rootCauseMessage(failure)})"
+        val partRunResults = mutableMapOf<String, MutableSet<String>>()
+        val partDocsToQueries = mutableMapOf<String, MutableList<String>>()
+        val isolation = try {
+            percolateIsolatingFailures(docs, MAX_ISOLATED_PERCOLATE_FAILURES, ::isTransientFailure) { part ->
+                percolateDocsAndCollectHits(
+                    part.toMutableList(),
+                    monitor,
+                    monitorMetadata,
+                    monitorInputIndices,
+                    concreteIndices,
+                    partRunResults,
+                    partDocsToQueries
+                )
+            }
+        } catch (e: Exception) {
+            log.error(
+                "Monitor ${monitor.id}: $batch, and evaluating it in parts could not be completed " +
+                    "(${rootCauseMessage(e)}). Their sequence numbers stay uncommitted, so the next run evaluates " +
+                    "them again."
+            )
+            return DetectionCoverageGap(deferredDocs = docs.size)
+        }
+
+        partRunResults.forEach { (query, docIds) -> inputRunResults.getOrPut(query) { mutableSetOf() }.addAll(docIds) }
+        partDocsToQueries.forEach { (docId, queries) -> docsToQueries.getOrPut(docId) { mutableListOf() }.addAll(queries) }
+        commitPendingSeqNos(pendingSeqNos, commitSeqNo)
+
+        val skipped = isolation.failing.size + isolation.unresolved.size
+        if (skipped == 0) {
+            log.warn("Monitor ${monitor.id}: $batch, but every document was evaluated when the batch was split.")
+            return DetectionCoverageGap()
+        }
+        val failingDocs = isolation.failing.joinToString { "${it.second.concreteIndexName}/${it.first}" }
+        val unresolved = if (isolation.unresolved.isEmpty()) {
+            ""
+        } else {
+            " ${isolation.unresolved.size} more document(s) were not evaluated, because the search for the failing " +
+                "ones stops after $MAX_ISOLATED_PERCOLATE_FAILURES."
+        }
+        log.error(
+            "Monitor ${monitor.id}: $batch. Evaluated the batch in parts: ${isolation.failing.size} document(s) " +
+                "fail on their own and will not be evaluated by this monitor's queries: [$failingDocs].$unresolved " +
+                "The other ${docs.size - skipped} document(s) were evaluated."
+        )
+        return DetectionCoverageGap(abandonedDocs = skipped)
     }
 
     /** Runs the percolate query for [docs] and folds the queries it matched into the run results. */
@@ -1079,16 +1159,21 @@ class TransportDocLevelMonitorFanOutAction
             monitorInputIndices,
         )
 
-        percolateQueryResponseHits.forEach { hit ->
-            var id = hit.id
-            concreteIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
-            monitorInputIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
-            val docIndices = hit.field("_percolator_document_slot").values.map { it.toString().toInt() }
-            docIndices.forEach { idx ->
-                val docIndex = "${docs[idx].first}|${docs[idx].second.concreteIndexName}"
-                inputRunResults.getOrPut(id) { mutableSetOf() }.add(docIndex)
-                docsToQueries.getOrPut(docIndex) { mutableListOf() }.add(id)
-            }
+        val unlisted = collectPercolateHits(
+            percolateQueryResponseHits,
+            docs,
+            monitor,
+            concreteIndices,
+            monitorInputIndices,
+            inputRunResults,
+            docsToQueries
+        )
+        if (unlisted.isNotEmpty()) {
+            log.warn(
+                "Monitor ${monitor.id}: its query index holds ${unlisted.size} queries the monitor does not list, " +
+                    "left by an earlier version of the monitor: ${unlisted.sorted().take(10)}. Their matches are " +
+                    "ignored; the queries are deleted the next time the monitor indexes its queries."
+            )
         }
         totalDocsQueriedStat += docs.size.toLong()
     }
@@ -1188,6 +1273,7 @@ class TransportDocLevelMonitorFanOutAction
             SearchRequest().indices(*queryIndices.toTypedArray()).preference(Preference.PRIMARY_FIRST.type())
         val searchSourceBuilder = SearchSourceBuilder()
         searchSourceBuilder.query(boolQueryBuilder)
+        searchSourceBuilder.size(MAX_SEARCH_SIZE)
         searchRequest.source(searchSourceBuilder)
         val cancelTimeout = getCancelAfterTimeInterval()
         if (cancelTimeout != -1L) {
@@ -1220,6 +1306,12 @@ class TransportDocLevelMonitorFanOutAction
         }
         log.debug("Monitor ${monitor.id} PERF_DEBUG: Percolate query time taken millis = ${response.took}")
         percolateQueriesTimeTakenStat += response.took.millis
+        describePercolateTruncation(response.hits)?.let { shortfall ->
+            log.warn(
+                "Monitor ${monitor.id}: percolate search for ${docs.size} document(s) of " +
+                    "[${concreteIndices.joinToString()}] $shortfall. The matches left out produce no findings in this run."
+            )
+        }
         return response.hits
     }
 
@@ -1612,4 +1704,42 @@ class TransportDocLevelMonitorFanOutAction
         var docId: String,
         var docSource: BytesReference
     )
+}
+
+/**
+ * Folds the queries [hits] matched into [inputRunResults] and [docsToQueries], by query id, and returns the ids
+ * of the hits that are not queries of [monitor].
+ *
+ * Wazuh: a run of an older version of the monitor can index its queries again after an update replaced them,
+ * leaving query documents of queries the monitor no longer lists. They are skipped: they cannot make a
+ * finding, and treating them as queries of the monitor failed every run from then on
+ * (wazuh/wazuh-indexer#2105).
+ */
+internal fun collectPercolateHits(
+    hits: Iterable<SearchHit>,
+    docs: List<Pair<String, TransportDocLevelMonitorFanOutAction.TransformedDocDto>>,
+    monitor: Monitor,
+    concreteIndices: List<String>,
+    monitorInputIndices: List<String>,
+    inputRunResults: MutableMap<String, MutableSet<String>>,
+    docsToQueries: MutableMap<String, MutableList<String>>
+): Set<String> {
+    val queryIds = (monitor.inputs[0] as DocLevelMonitorInput).queries.mapTo(HashSet()) { it.id }
+    val unlisted = mutableSetOf<String>()
+    hits.forEach { hit ->
+        var id = hit.id
+        concreteIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
+        monitorInputIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
+        if (id !in queryIds) {
+            unlisted.add(id)
+            return@forEach
+        }
+        val docIndices = hit.field("_percolator_document_slot").values.map { it.toString().toInt() }
+        docIndices.forEach { idx ->
+            val docIndex = "${docs[idx].first}|${docs[idx].second.concreteIndexName}"
+            inputRunResults.getOrPut(id) { mutableSetOf() }.add(docIndex)
+            docsToQueries.getOrPut(docIndex) { mutableListOf() }.add(id)
+        }
+    }
+    return unlisted
 }

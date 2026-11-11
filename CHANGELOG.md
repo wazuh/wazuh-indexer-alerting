@@ -26,6 +26,7 @@
 
 | Issue | Comment |
 |-------|---------|
+| [#176](https://github.com/wazuh/wazuh-indexer-alerting/issues/176) | Fix doc-level monitors reporting at most 10 matching queries per run |
 | [#1876](https://github.com/wazuh/wazuh-indexer/issues/1876) | Fix doc-level monitors skipping documents when search backpressure cancels their percolate search |
 | [#1518](https://github.com/wazuh/wazuh-indexer-plugins/issues/1518) | Fix rules over a field the source index does not map being silently dropped |
 | [#1746](https://github.com/wazuh/wazuh-indexer/issues/1746) | Fix a memory leak in doc-level monitors that exhausted the Java heap |
