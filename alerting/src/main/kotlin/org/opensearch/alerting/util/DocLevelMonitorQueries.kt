@@ -337,12 +337,13 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             }
             val updatedIndexName = indexName.replace("*", "_")
             // Wazuh: nothing to do for a source index whose queries are indexed and current.
-            if (
-                reuseIndexedQueries &&
+            val alreadyIndexed = if (reuseIndexedQueries) {
                 queriesAlreadyIndexed(monitor, monitorId, monitorMetadata, updatedIndexName, concreteIndices, clusterState)
-            ) {
-                val indexed = indexedQueries.get(monitorId, updatedIndexName)!!
-                currentQueries.add(indexed.state.queryIndex, indexed.docIds)
+            } else {
+                null
+            }
+            if (alreadyIndexed != null) {
+                currentQueries.add(alreadyIndexed.state.queryIndex, alreadyIndexed.docIds)
                 return@forEach
             }
             val updatedProperties = mutableMapOf<String, Any>()
@@ -523,8 +524,8 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
     }
 
     /**
-     * Wazuh: true when this node already indexed the queries of [monitor] for [sourceIndex], from the same
-     * monitor, source index mappings and query index, and their documents are still there. Internal, not
+     * Wazuh: the [IndexedQueries] when this node already indexed the queries of [monitor] for [sourceIndex], from the same
+     * monitor, source index mappings and query index, and their documents are still there, null otherwise. Internal, not
      * private, for IndexedQueriesTests.
      */
     internal suspend fun queriesAlreadyIndexed(
@@ -534,21 +535,21 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         sourceIndex: String,
         concreteIndices: List<String>,
         clusterState: ClusterState
-    ): Boolean {
-        val indexed = indexedQueries.get(monitorId, sourceIndex) ?: return false
+    ): IndexedQueries? {
+        val indexed = indexedQueries.get(monitorId, sourceIndex) ?: return null
         // The fan-out percolates against the query index of the metadata: no entry, no queries.
-        val queryIndex = monitorMetadata.sourceToQueryIndexMapping[sourceIndex + monitor.id] ?: return false
+        val queryIndex = monitorMetadata.sourceToQueryIndexMapping[sourceIndex + monitor.id] ?: return null
         // updateQueryIndexMappings moves such a monitor to the current write index of its query index alias.
         if (
             queryIndex != monitor.dataSources.queryIndex &&
             monitor.deleteQueryIndexInEveryRun == true &&
             getWriteIndexNameForAlias(monitor.dataSources.queryIndex) != queryIndex
         ) {
-            return false
+            return null
         }
-        val queryIndexUuid = clusterState.metadata.indicesLookup[queryIndex]?.writeIndex?.indexUUID ?: return false
+        val queryIndexUuid = clusterState.metadata.indicesLookup[queryIndex]?.writeIndex?.indexUUID ?: return null
         if (indexed.state != IndexedQueriesState.of(monitor, concreteIndices, queryIndex, queryIndexUuid, clusterState)) {
-            return false
+            return null
         }
         // Their documents can be deleted without the monitor changing, for example by a failed update of the monitor.
         val found = countQueryDocs(queryIndex, indexed.docIds)
@@ -557,10 +558,10 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                 "Monitor $monitorId: $found of the ${indexed.docIds.size} queries of [$sourceIndex] found in " +
                     "[$queryIndex]. Indexing them again."
             )
-            return false
+            return null
         }
         log.debug("Monitor $monitorId: the ${indexed.docIds.size} queries of [$sourceIndex] are indexed and current in [$queryIndex]")
-        return true
+        return indexed
     }
 
     /**

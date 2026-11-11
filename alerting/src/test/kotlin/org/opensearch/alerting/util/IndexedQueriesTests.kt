@@ -232,7 +232,7 @@ class IndexedQueriesTests : OpenSearchTestCase() {
         monitor: Monitor,
         metadata: MonitorMetadata,
         state: ClusterState = clusterState()
-    ) = runBlocking { queries.queriesAlreadyIndexed(monitor, "mid", metadata, source, listOf(source), state) }
+    ) = runBlocking { queries.queriesAlreadyIndexed(monitor, "mid", metadata, source, listOf(source), state) != null }
 
     private fun searchResponse(total: Long) = SearchResponse(
         InternalSearchResponse(
