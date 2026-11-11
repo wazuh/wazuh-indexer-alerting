@@ -1159,16 +1159,21 @@ class TransportDocLevelMonitorFanOutAction
             monitorInputIndices,
         )
 
-        percolateQueryResponseHits.forEach { hit ->
-            var id = hit.id
-            concreteIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
-            monitorInputIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
-            val docIndices = hit.field("_percolator_document_slot").values.map { it.toString().toInt() }
-            docIndices.forEach { idx ->
-                val docIndex = "${docs[idx].first}|${docs[idx].second.concreteIndexName}"
-                inputRunResults.getOrPut(id) { mutableSetOf() }.add(docIndex)
-                docsToQueries.getOrPut(docIndex) { mutableListOf() }.add(id)
-            }
+        val unlisted = collectPercolateHits(
+            percolateQueryResponseHits,
+            docs,
+            monitor,
+            concreteIndices,
+            monitorInputIndices,
+            inputRunResults,
+            docsToQueries
+        )
+        if (unlisted.isNotEmpty()) {
+            log.warn(
+                "Monitor ${monitor.id}: its query index holds ${unlisted.size} queries the monitor does not list, " +
+                    "left by an earlier version of the monitor: ${unlisted.sorted().take(10)}. Their matches are " +
+                    "ignored; the queries are deleted the next time the monitor indexes its queries."
+            )
         }
         totalDocsQueriedStat += docs.size.toLong()
     }
@@ -1699,4 +1704,42 @@ class TransportDocLevelMonitorFanOutAction
         var docId: String,
         var docSource: BytesReference
     )
+}
+
+/**
+ * Folds the queries [hits] matched into [inputRunResults] and [docsToQueries], by query id, and returns the ids
+ * of the hits that are not queries of [monitor].
+ *
+ * Wazuh: a run of an older version of the monitor can index its queries again after an update replaced them,
+ * leaving query documents of queries the monitor no longer lists. They are skipped: they cannot make a
+ * finding, and treating them as queries of the monitor failed every run from then on
+ * (wazuh/wazuh-indexer#2105).
+ */
+internal fun collectPercolateHits(
+    hits: Iterable<SearchHit>,
+    docs: List<Pair<String, TransportDocLevelMonitorFanOutAction.TransformedDocDto>>,
+    monitor: Monitor,
+    concreteIndices: List<String>,
+    monitorInputIndices: List<String>,
+    inputRunResults: MutableMap<String, MutableSet<String>>,
+    docsToQueries: MutableMap<String, MutableList<String>>
+): Set<String> {
+    val queryIds = (monitor.inputs[0] as DocLevelMonitorInput).queries.mapTo(HashSet()) { it.id }
+    val unlisted = mutableSetOf<String>()
+    hits.forEach { hit ->
+        var id = hit.id
+        concreteIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
+        monitorInputIndices.forEach { id = id.replace("_${it}_${monitor.id}", "") }
+        if (id !in queryIds) {
+            unlisted.add(id)
+            return@forEach
+        }
+        val docIndices = hit.field("_percolator_document_slot").values.map { it.toString().toInt() }
+        docIndices.forEach { idx ->
+            val docIndex = "${docs[idx].first}|${docs[idx].second.concreteIndexName}"
+            inputRunResults.getOrPut(id) { mutableSetOf() }.add(docIndex)
+            docsToQueries.getOrPut(docIndex) { mutableListOf() }.add(id)
+        }
+    }
+    return unlisted
 }

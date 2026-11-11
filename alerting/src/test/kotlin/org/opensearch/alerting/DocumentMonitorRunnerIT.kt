@@ -3144,4 +3144,120 @@ class DocumentMonitorRunnerIT : AlertingRestTestCase() {
             assertEquals("Expected one action execution per alert, got messages $messages", 3, messages.toSet().size)
         }
     }
+
+    // Wazuh: scheduled runs keep the queries they indexed while those are current.
+    fun `test doc-level monitor runs index their queries again only when what they are built from changes`() {
+        // Each node keeps the queries it indexed, and a REST call can reach any node.
+        if (isMultiNode) return
+        val testIndex = createTestIndex()
+        val docQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "3", fields = listOf())
+        val docLevelInput = DocLevelMonitorInput("description", listOf(testIndex), listOf(docQuery))
+        val trigger = randomDocumentLevelTrigger(condition = ALWAYS_RUN)
+        val monitor = createMonitor(
+            randomDocumentLevelMonitor(inputs = listOf(docLevelInput), triggers = listOf(trigger), enabled = false)
+        )
+        // Only fields the index maps, so that indexing documents does not change its mapping.
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        val testDoc = """{ "test_strict_date_time" : "$testTime", "test_field" : "us-west-2" }"""
+
+        // The creation of the monitor indexed the query, but the first run cannot know it.
+        executeMonitor(monitor.id)
+        val indexed = queryDocSeqNo(monitor, docQuery, testIndex)
+        assertNotNull("The query is not in the query index", indexed)
+
+        executeMonitor(monitor.id)
+        assertEquals("A run indexed a query that had not changed", indexed, queryDocSeqNo(monitor, docQuery, testIndex))
+
+        indexDoc(testIndex, "1", testDoc)
+        assertEquals(listOf("1|$testIndex"), matchingDocs(executeMonitor(monitor.id), docQuery))
+        assertEquals("A run indexed a query that had not changed", indexed, queryDocSeqNo(monitor, docQuery, testIndex))
+
+        // A new field in the source mapping: the query is built again.
+        client().makeRequest(
+            "PUT", "/$testIndex/_mapping",
+            StringEntity("""{ "properties": { "new_field": { "type": "keyword" } } }""", ContentType.APPLICATION_JSON)
+        )
+        executeMonitor(monitor.id)
+        val afterMappingChange = queryDocSeqNo(monitor, docQuery, testIndex)
+        assertNotEquals("A run did not index the query after a mapping change", indexed, afterMappingChange)
+        executeMonitor(monitor.id)
+        assertEquals("A run indexed a query that had not changed", afterMappingChange, queryDocSeqNo(monitor, docQuery, testIndex))
+
+        // The query document is gone although nothing it is built from changed: it is indexed again.
+        adminClient().makeRequest(
+            "POST", "/${monitor.dataSources.queryIndex}/_delete_by_query?refresh=true",
+            StringEntity("""{ "query": { "match": { "monitor_id": "${monitor.id}" } } }""", ContentType.APPLICATION_JSON)
+        )
+        assertNull(queryDocSeqNo(monitor, docQuery, testIndex))
+        indexDoc(testIndex, "2", testDoc)
+        assertEquals(listOf("2|$testIndex"), matchingDocs(executeMonitor(monitor.id), docQuery))
+        assertNotNull("A run did not index the deleted query", queryDocSeqNo(monitor, docQuery, testIndex))
+    }
+
+    // Wazuh: wazuh/wazuh-indexer#2105
+    fun `test doc-level monitor runs ignore and then delete the queries the monitor no longer lists`() {
+        val testIndex = createTestIndex()
+        val west = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "west", fields = listOf())
+        val east = DocLevelQuery(query = "test_field:\"us-east-1\"", name = "east", fields = listOf())
+        val trigger = randomDocumentLevelTrigger(condition = ALWAYS_RUN)
+        val monitor = createMonitor(
+            randomDocumentLevelMonitor(
+                inputs = listOf(DocLevelMonitorInput("description", listOf(testIndex), listOf(west, east))),
+                triggers = listOf(trigger),
+                enabled = false
+            )
+        )
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        executeMonitor(monitor.id)
+
+        // A query document the monitor does not list, matching what `west` matches: its matches are ignored.
+        val removed = DocLevelQuery(id = "removed", query = "test_field:\"us-west-2\"", name = "removed", fields = listOf())
+        indexQueryDoc(monitor, removed, testIndex)
+        indexDoc(testIndex, "1", """{ "test_strict_date_time" : "$testTime", "test_field" : "us-west-2" }""")
+        val run = executeMonitor(monitor.id)
+        assertNull("The run failed", entityAsMap(run)["error"])
+        assertEquals(listOf("1|$testIndex"), matchingDocs(run, west))
+        assertEquals(emptyList<String>(), matchingDocs(run, removed))
+
+        // An update drops `east`, and a run of the previous version indexes it again afterwards.
+        updateMonitor(monitor.copy(inputs = listOf(DocLevelMonitorInput("description", listOf(testIndex), listOf(west)))))
+        indexQueryDoc(monitor, east, testIndex)
+        indexDoc(testIndex, "2", """{ "test_strict_date_time" : "$testTime", "test_field" : "us-east-1" }""")
+        val afterUpdate = executeMonitor(monitor.id)
+        assertNull("The run failed", entityAsMap(afterUpdate)["error"])
+        assertNull("A query the monitor no longer lists is still indexed", queryDocSeqNo(monitor, east, testIndex))
+        assertNull("A query the monitor no longer lists is still indexed", queryDocSeqNo(monitor, removed, testIndex))
+        assertNotNull("The query of the monitor is gone", queryDocSeqNo(monitor, west, testIndex))
+    }
+
+    /** Indexes a query document for [query] and [monitor], as indexing the queries of a monitor writes it. */
+    private fun indexQueryDoc(monitor: Monitor, query: DocLevelQuery, index: String) {
+        val queryString = "test_field_${index}_${monitor.id}:${query.query.substringAfter(":")}".replace("\"", "\\\"")
+        adminClient().makeRequest(
+            "PUT", "/${monitor.dataSources.queryIndex}/_doc/${query.id}_${index}_${monitor.id}?refresh=true",
+            StringEntity(
+                """{ "query": { "query_string": { "query": "$queryString", "fields": [] } }, "monitor_id": "${monitor.id}", "index": "$index" }""",
+                ContentType.APPLICATION_JSON
+            )
+        )
+    }
+
+    /** The sequence number of the document of [query] in the query index of [monitor], which changes with each write. */
+    private fun queryDocSeqNo(monitor: Monitor, query: DocLevelQuery, index: String): Long? {
+        val id = "${query.id}_${index}_${monitor.id}"
+        val response = try {
+            adminClient().makeRequest("GET", "/${monitor.dataSources.queryIndex}/_doc/$id")
+        } catch (e: ResponseException) {
+            if (e.response.restStatus() == RestStatus.NOT_FOUND) return null
+            throw e
+        }
+        return (entityAsMap(response)["_seq_no"] as Number).toLong()
+    }
+
+    private fun matchingDocs(response: Response, query: DocLevelQuery): List<String> {
+        @Suppress("UNCHECKED_CAST")
+        val results = (entityAsMap(response).objectMap("input_results")["results"] as List<Map<String, Any>>).first()
+        @Suppress("UNCHECKED_CAST")
+        return (results[query.id] as List<String>?).orEmpty()
+    }
 }
