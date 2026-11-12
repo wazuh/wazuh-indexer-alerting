@@ -7,8 +7,13 @@ package org.opensearch.alerting
 import kotlinx.coroutines.runBlocking
 import org.apache.lucene.search.TotalHits
 import org.apache.lucene.search.TotalHits.Relation
+import org.opensearch.commons.alerting.model.DocLevelMonitorInput
+import org.opensearch.commons.alerting.model.DocLevelQuery
+import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.core.index.Index
 import org.opensearch.core.index.shard.ShardId
+import org.opensearch.index.query.BoolQueryBuilder
+import org.opensearch.index.query.QueryStringQueryBuilder
 import org.opensearch.search.SearchHit
 import org.opensearch.search.SearchHits
 import org.opensearch.test.OpenSearchTestCase
@@ -164,6 +169,73 @@ class MonitorFanOutUtilsTests : OpenSearchTestCase() {
         commitPendingSeqNos(pending) { _, _ -> fail("there was nothing to commit") }
         assertTrue(pending.isEmpty())
     }
+
+    fun `test a shard read to the end with an empty batch is committed at once`() {
+        // None of the documents up to 7000 matched, so nothing is waiting for a percolate search.
+        val pending = mutableMapOf<String, Long>()
+        val committed = mutableMapOf<String, Long>()
+
+        markShardRead("0", 7000L, batchIsEmpty = true, pending) { shard, seqNo -> committed[shard] = seqNo }
+
+        assertEquals(mapOf("0" to 7000L), committed)
+        assertTrue(pending.isEmpty())
+    }
+
+    fun `test a shard committed at once drops the lower sequence number held back for it`() {
+        // The matching documents read from shard 0 gave no document to percolate, so 1200 stayed held back.
+        // A later batch must not commit it over 7000.
+        val pending = mutableMapOf("0" to 1200L, "1" to 300L)
+        val committed = mutableMapOf<String, Long>()
+
+        markShardRead("0", 7000L, batchIsEmpty = true, pending) { shard, seqNo -> committed[shard] = seqNo }
+        commitPendingSeqNos(pending) { shard, seqNo -> committed[shard] = seqNo }
+
+        assertEquals(mapOf("0" to 7000L, "1" to 300L), committed)
+    }
+
+    fun `test a shard read to the end with documents waiting is held back until they are evaluated`() {
+        // Documents up to 1200 matched and wait in the batch; the rest of the shard, up to 7000, did not match.
+        val pending = mutableMapOf("0" to 1200L)
+        val committed = mutableMapOf<String, Long>()
+
+        markShardRead("0", 7000L, batchIsEmpty = false, pending) { shard, seqNo -> committed[shard] = seqNo }
+
+        assertTrue("Nothing is committed before the batch is evaluated", committed.isEmpty())
+        assertEquals(mapOf("0" to 7000L), pending)
+    }
+
+    fun `test an active response monitor reads only the documents that match one of its queries`() {
+        val queries = listOf(
+            DocLevelQuery(id = "blocked-login", name = "blocked-login", fields = listOf(), query = "event.code:\"4625\""),
+            DocLevelQuery(id = "new-service", name = "new-service", fields = listOf("event.action^2"), query = "service-installed")
+        )
+        val monitor = activeResponseMonitor(queries)
+
+        val filter = matchFilterOf(monitor) as BoolQueryBuilder
+
+        assertEquals("1", filter.minimumShouldMatch())
+        assertTrue(filter.must().isEmpty() && filter.filter().isEmpty() && filter.mustNot().isEmpty())
+        val clauses = filter.should().map { it as QueryStringQueryBuilder }
+        assertEquals(listOf("event.code:\"4625\"", "service-installed"), clauses.map { it.queryString() })
+        assertEquals("A query that names no fields searches all of them", mapOf("*" to 1.0f), clauses[0].fields())
+        assertEquals(mapOf("event.action" to 2.0f), clauses[1].fields())
+    }
+
+    fun `test other doc level monitors keep reading every document`() {
+        val monitor = randomDocumentLevelMonitor(
+            inputs = listOf(DocLevelMonitorInput("description", listOf("index"), listOf(randomDocLevelQuery())))
+        )
+        assertNull(matchFilterOf(monitor))
+    }
+
+    fun `test an active response monitor without queries keeps reading every document`() {
+        assertNull(matchFilterOf(activeResponseMonitor(emptyList())))
+    }
+
+    private fun activeResponseMonitor(queries: List<DocLevelQuery>): Monitor =
+        randomDocumentLevelMonitor(
+            inputs = listOf(DocLevelMonitorInput("description", listOf("wazuh-findings-v5-security"), queries))
+        ).copy(monitorType = Monitor.MonitorType.ACTIVE_RESPONSE_MONITOR.value)
 
     fun `test a percolate search that returned every matched query is not reported`() {
         assertNull(describePercolateTruncation(percolateHits(returned = 12, total = 12, Relation.EQUAL_TO)))

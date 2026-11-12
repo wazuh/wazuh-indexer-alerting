@@ -3145,6 +3145,44 @@ class DocumentMonitorRunnerIT : AlertingRestTestCase() {
         }
     }
 
+    // Wazuh: an active response monitor reads only the documents that match one of its queries.
+    fun `test active response monitor matches each document to its query among documents that match none`() {
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        fun doc(message: String, region: String) = """{
+            "message" : "$message",
+            "test_strict_date_time" : "$testTime",
+            "test_field" : "$region"
+        }"""
+
+        val index = createTestIndex()
+
+        val regionQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "region", fields = listOf())
+        val messageQuery = DocLevelQuery(query = "message:(disk AND full)", name = "message", fields = listOf())
+        // A term with no field name matches in any field.
+        val anyFieldQuery = DocLevelQuery(query = "\"eu-west-1\"", name = "any-field", fields = listOf())
+        val docLevelInput =
+            DocLevelMonitorInput("description", listOf(index), listOf(regionQuery, messageQuery, anyFieldQuery))
+        val monitor = randomDocumentLevelMonitor(
+            inputs = listOf(docLevelInput),
+            triggers = listOf(randomDocumentLevelTrigger(condition = ALWAYS_RUN))
+        ).copy(monitorType = Monitor.MonitorType.ACTIVE_RESPONSE_MONITOR.value)
+
+        indexDoc(index, "1", doc("service restarted", "us-west-2"))
+        indexDoc(index, "2", doc("service restarted", "us-east-1"))
+        indexDoc(index, "3", doc("the disk is full", "us-east-1"))
+        indexDoc(index, "4", doc("the disk is healthy", "eu-west-1"))
+        indexDoc(index, "5", doc("the disk is full", "us-west-2"))
+
+        val output = entityAsMap(executeMonitor(monitor, params = DRYRUN_MONITOR))
+
+        assertEquals(monitor.name, output["monitor_name"])
+        @Suppress("UNCHECKED_CAST")
+        val inputResults = (output.objectMap("input_results")["results"] as List<Map<String, List<String>>>).first()
+        assertEquals(setOf("1|$index", "5|$index"), inputResults[regionQuery.id]?.toSet())
+        assertEquals(setOf("3|$index", "5|$index"), inputResults[messageQuery.id]?.toSet())
+        assertEquals(setOf("4|$index"), inputResults[anyFieldQuery.id]?.toSet())
+    }
+
     // Wazuh: scheduled runs keep the queries they indexed while those are current.
     fun `test doc-level monitor runs index their queries again only when what they are built from changes`() {
         // Each node keeps the queries it indexed, and a REST call can reach any node.

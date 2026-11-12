@@ -32,6 +32,8 @@ import org.opensearch.alerting.action.GetDestinationsRequest
 import org.opensearch.alerting.action.GetDestinationsResponse
 import org.opensearch.alerting.commitPendingSeqNos
 import org.opensearch.alerting.describePercolateTruncation
+import org.opensearch.alerting.markShardRead
+import org.opensearch.alerting.matchFilterOf
 import org.opensearch.alerting.model.AlertContext
 import org.opensearch.alerting.model.destination.Destination
 import org.opensearch.alerting.model.destination.DestinationContextFactory
@@ -116,6 +118,7 @@ import org.opensearch.core.xcontent.ToXContent
 import org.opensearch.core.xcontent.XContentBuilder
 import org.opensearch.index.query.BoolQueryBuilder
 import org.opensearch.index.query.Operator
+import org.opensearch.index.query.QueryBuilder
 import org.opensearch.index.query.QueryBuilders
 import org.opensearch.index.query.QueryShardException
 import org.opensearch.index.seqno.SequenceNumbers
@@ -831,6 +834,9 @@ class TransportDocLevelMonitorFanOutAction
         updateLastRunContext: (String, Long) -> Unit
     ): DetectionCoverageGap {
         var gap = DetectionCoverageGap()
+        // Narrows the read of an Active Response monitor to the documents that match its queries. Dropped
+        // for the rest of the run if the index cannot apply it.
+        var matchFilter = matchFilterOf(monitor)
         for (shardId in shardList) {
             val shard = shardId.toString()
             try {
@@ -887,17 +893,44 @@ class TransportDocLevelMonitorFanOutAction
                         )
                         break
                     }
-                    val hits = searchShard(
-                        monitor,
-                        indexExecutionCtx.concreteIndexName,
-                        shard,
-                        currentSeqNo,
-                        maxSeqNo,
-                        indexExecutionCtx.docIds,
-                        fieldsToBeQueried
-                    )
+                    val hits = try {
+                        searchShard(
+                            monitor,
+                            indexExecutionCtx.concreteIndexName,
+                            shard,
+                            currentSeqNo,
+                            maxSeqNo,
+                            indexExecutionCtx.docIds,
+                            fieldsToBeQueried,
+                            matchFilter
+                        )
+                    } catch (e: Exception) {
+                        if (matchFilter == null || isTransientFailure(e)) {
+                            throw e
+                        }
+                        // The index could not apply the monitor's queries, so read every document as any
+                        // other doc-level monitor does: the percolate search still decides what matches.
+                        log.warn(
+                            "Monitor ${monitor.id}: reading only the documents of " +
+                                "[${indexExecutionCtx.concreteIndexName}][$shard] that match its queries failed " +
+                                "(${rootCauseMessage(e)}). Reading every document for the rest of this run."
+                        )
+                        matchFilter = null
+                        searchShard(
+                            monitor,
+                            indexExecutionCtx.concreteIndexName,
+                            shard,
+                            currentSeqNo,
+                            maxSeqNo,
+                            indexExecutionCtx.docIds,
+                            fieldsToBeQueried
+                        )
+                    }
 
                     if (hits.hits.isEmpty()) {
+                        if (matchFilter != null) {
+                            markShardRead(shard, maxSeqNo, transformedDocs.isEmpty(), pendingSeqNos, updateLastRunContext)
+                        }
                         break
                     }
 
@@ -1333,12 +1366,16 @@ class TransportDocLevelMonitorFanOutAction
         maxSeqNo: Long,
         docIds: List<String>? = null,
         fieldsToFetch: List<String>,
+        matchFilter: QueryBuilder? = null,
     ): SearchHits {
         if (prevSeqNo?.equals(maxSeqNo) == true && maxSeqNo != 0L) {
             return SearchHits.empty()
         }
         val boolQueryBuilder = BoolQueryBuilder()
         boolQueryBuilder.filter(QueryBuilders.rangeQuery("_seq_no").gt(prevSeqNo).lte(maxSeqNo))
+        if (matchFilter != null) {
+            boolQueryBuilder.filter(matchFilter)
+        }
 
         if (monitor.shouldCreateSingleAlertForFindings == null || monitor.shouldCreateSingleAlertForFindings == false) {
             if (!docIds.isNullOrEmpty()) {
