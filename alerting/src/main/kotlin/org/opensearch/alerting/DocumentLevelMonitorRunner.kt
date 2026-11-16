@@ -142,7 +142,10 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                 monitor = monitor,
                 monitorId = monitor.id,
                 monitorMetadata,
-                indexTimeout = monitorCtx.indexTimeout!!
+                indexTimeout = monitorCtx.indexTimeout!!,
+                // Wazuh: a scheduled run keeps the queries indexed by a previous run while they are current. A dry
+                // run or a temporary monitor has its queries deleted at the end, so it always indexes them.
+                reuseIndexedQueries = !isTempMonitor
             )
 
             // cleanup old indices that are not monitored anymore from the same monitor
