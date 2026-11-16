@@ -29,6 +29,7 @@ import org.opensearch.commons.alerting.model.BucketLevelTriggerRunResult
 import org.opensearch.commons.alerting.model.DocLevelMonitorInput
 import org.opensearch.commons.alerting.model.DocumentLevelTrigger
 import org.opensearch.commons.alerting.model.Monitor
+import org.opensearch.commons.alerting.model.MonitorMetadata
 import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.model.Trigger
 import org.opensearch.commons.alerting.model.action.Action
@@ -40,6 +41,7 @@ import org.opensearch.commons.alerting.util.isMonitorOfStandardType
 import org.opensearch.core.common.breaker.CircuitBreakingException
 import org.opensearch.core.common.bytes.BytesReference
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException
+import org.opensearch.core.rest.RestStatus
 import org.opensearch.core.tasks.TaskCancelledException
 import org.opensearch.core.xcontent.NamedXContentRegistry
 import org.opensearch.core.xcontent.ToXContent
@@ -554,4 +556,92 @@ fun mergeShardCheckpoints(ours: Map<*, *>, theirs: Map<*, *>): MutableMap<String
         }
     }
     return merged
+}
+
+/**
+ * A copy of this metadata with a query index mapping of its own: indexing a monitor's queries updates the
+ * mapping in place, and [MonitorMetadata.copy] shares it.
+ */
+fun MonitorMetadata.withOwnQueryIndexMapping(): MonitorMetadata =
+    copy(sourceToQueryIndexMapping = LinkedHashMap(sourceToQueryIndexMapping))
+
+/**
+ * Re-applies the change an index monitor or index workflow request made to a monitor's metadata on top of the
+ * copy stored now ([current]), after another writer, normally a run checkpointing it, moved the document
+ * between the request's read ([base]) and its write ([update], computed from [base]):
+ *
+ * - the run context is [update]'s when [resetRunContext] is set (the monitor or workflow was re-enabled and
+ *   starts again from the current documents); otherwise it is [current]'s, which holds the runs' progress,
+ *   plus the indices the request added, that is, those in [update] and not in [base];
+ * - the query index mapping is [current]'s with the entries the request added, changed or removed relative
+ *   to [base] applied on top.
+ *
+ * Everything else, including the document's sequence number, is [current]'s.
+ */
+fun reapplyMetadataUpdate(
+    current: MonitorMetadata,
+    base: MonitorMetadata,
+    update: MonitorMetadata,
+    resetRunContext: Boolean
+): MonitorMetadata {
+    val lastRunContext = if (resetRunContext) {
+        update.lastRunContext
+    } else {
+        val merged = LinkedHashMap(current.lastRunContext)
+        update.lastRunContext.forEach { (indexName, checkpoints) ->
+            if (!base.lastRunContext.containsKey(indexName)) {
+                merged.putIfAbsent(indexName, checkpoints)
+            }
+        }
+        merged
+    }
+    val queryIndexMapping = LinkedHashMap(current.sourceToQueryIndexMapping)
+    update.sourceToQueryIndexMapping.forEach { (sourceIndex, queryIndex) ->
+        if (base.sourceToQueryIndexMapping[sourceIndex] != queryIndex) {
+            queryIndexMapping[sourceIndex] = queryIndex
+        }
+    }
+    base.sourceToQueryIndexMapping.keys
+        .filterNot { update.sourceToQueryIndexMapping.containsKey(it) }
+        .forEach { queryIndexMapping.remove(it) }
+    return current.copy(lastRunContext = lastRunContext, sourceToQueryIndexMapping = queryIndexMapping)
+}
+
+/**
+ * Writes the metadata an index monitor or index workflow request computed ([update]) without failing the
+ * request when a run checkpointed the same document in the meantime (wazuh/wazuh-indexer#2108).
+ *
+ * [write] returns null on a version conflict. On a conflict the stored copy is read again with [read], the
+ * request's change is re-applied on top of it with [reapply] and the write is retried, up to [maxAttempts]
+ * writes. When the stored copy already holds the change, nothing is written and the stored copy is returned.
+ */
+suspend fun writeMetadataReapplyingOnConflict(
+    update: MonitorMetadata,
+    maxAttempts: Int,
+    write: suspend (MonitorMetadata) -> MonitorMetadata?,
+    read: suspend () -> MonitorMetadata?,
+    reapply: (MonitorMetadata) -> MonitorMetadata
+): MonitorMetadata {
+    var metadata = update
+    for (attempt in 1..maxAttempts) {
+        write(metadata)?.let { return it }
+        if (attempt == maxAttempts) {
+            break
+        }
+        val current = read()
+        if (current == null) {
+            val reason = "Could not store the metadata ${update.id}: the document no longer exists"
+            throw AlertingException(reason, RestStatus.NOT_FOUND, IllegalStateException(reason))
+        }
+        metadata = reapply(current)
+        if (metadata.lastRunContext == current.lastRunContext &&
+            metadata.sourceToQueryIndexMapping == current.sourceToQueryIndexMapping
+        ) {
+            logger.debug("Metadata {} moved under the update and already holds its change; not writing it", update.id)
+            return current
+        }
+        logger.debug("Metadata {} moved under the update, re-applying the change and retrying ({}/{})", update.id, attempt, maxAttempts)
+    }
+    val reason = "Could not store the metadata ${update.id}: the document kept changing after $maxAttempts attempts"
+    throw AlertingException(reason, RestStatus.CONFLICT, IllegalStateException(reason))
 }
