@@ -46,6 +46,7 @@ import org.opensearch.alerting.util.IndexUtils
 import org.opensearch.alerting.util.isADMonitor
 import org.opensearch.alerting.util.isQueryLevelMonitor
 import org.opensearch.alerting.util.use
+import org.opensearch.alerting.util.withOwnQueryIndexMapping
 import org.opensearch.alerting.workflow.CompositeWorkflowRunner
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.inject.Inject
@@ -417,6 +418,7 @@ class TransportIndexWorkflowAction @Inject constructor(
                     if (created == false) {
                         log.warn("Metadata doc id:${monitorMetadata.id} exists, but it shouldn't!")
                     }
+                    val readMetadata = monitorMetadata.withOwnQueryIndexMapping()
 
                     if (
                         Monitor.MonitorType.valueOf(monitor.monitorType.uppercase(Locale.ROOT)) == Monitor.MonitorType.DOC_LEVEL_MONITOR
@@ -424,8 +426,15 @@ class TransportIndexWorkflowAction @Inject constructor(
                         val oldMonitorMetadata = MonitorMetadataService.getMetadata(monitor)
                         monitorMetadata = monitorMetadata.copy(sourceToQueryIndexMapping = oldMonitorMetadata!!.sourceToQueryIndexMapping)
                     }
-                    // When inserting queries in queryIndex we could update sourceToQueryIndexMapping
-                    MonitorMetadataService.upsertMetadata(monitorMetadata, updating = true)
+                    // When inserting queries in queryIndex we could update sourceToQueryIndexMapping.
+                    // A first run of the workflow can checkpoint the same document meanwhile.
+                    MonitorMetadataService.upsertMetadataReapplyingOnConflict(
+                        monitor,
+                        workflowMetadataId = workflowMetadata.id,
+                        base = readMetadata,
+                        update = monitorMetadata,
+                        resetRunContext = false
+                    )
                 }
                 actionListener.onResponse(
                     IndexWorkflowResponse(
@@ -593,8 +602,16 @@ class TransportIndexWorkflowAction @Inject constructor(
                         val metadataChanged = isWorkflowRestarted ||
                             updatedMetadata.lastRunContext != monitorMetadata.lastRunContext ||
                             updatedMetadata.sourceToQueryIndexMapping != monitorMetadata.sourceToQueryIndexMapping
+                        // A run can checkpoint the document in the meantime: re-apply this update on top of it
+                        // rather than failing the update.
                         if (metadataChanged) {
-                            MonitorMetadataService.upsertMetadata(updatedMetadata, updating = true)
+                            MonitorMetadataService.upsertMetadataReapplyingOnConflict(
+                                monitor,
+                                workflowMetadataId = workflowMetadata.id,
+                                base = monitorMetadata,
+                                update = updatedMetadata,
+                                resetRunContext = isWorkflowRestarted
+                            )
                         }
                     }
                 }

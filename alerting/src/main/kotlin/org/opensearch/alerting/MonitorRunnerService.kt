@@ -303,6 +303,8 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
 
     override fun postIndex(job: ScheduledJob) {
         if (job is Monitor) {
+            // Wazuh: a new version of the monitor indexes its queries again on its next run.
+            monitorCtx.docLevelMonitorQueries?.forgetIndexedQueries(job.id)
             launch {
                 try {
                     monitorCtx.moveAlertsRetryPolicy!!.retry(logger) {
@@ -330,6 +332,8 @@ object MonitorRunnerService : JobRunner, CoroutineScope, AbstractLifecycleCompon
     }
 
     override fun postDelete(jobId: String) {
+        // Wazuh: nothing to keep for a deleted monitor.
+        monitorCtx.docLevelMonitorQueries?.forgetIndexedQueries(jobId)
         launch {
             try {
                 monitorCtx.moveAlertsRetryPolicy!!.retry(logger) {

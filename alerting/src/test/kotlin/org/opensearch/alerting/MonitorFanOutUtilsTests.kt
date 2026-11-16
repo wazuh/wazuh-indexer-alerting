@@ -4,8 +4,18 @@
  */
 package org.opensearch.alerting
 
+import kotlinx.coroutines.runBlocking
+import org.apache.lucene.search.TotalHits
+import org.apache.lucene.search.TotalHits.Relation
+import org.opensearch.commons.alerting.model.DocLevelMonitorInput
+import org.opensearch.commons.alerting.model.DocLevelQuery
+import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.core.index.Index
 import org.opensearch.core.index.shard.ShardId
+import org.opensearch.index.query.BoolQueryBuilder
+import org.opensearch.index.query.QueryStringQueryBuilder
+import org.opensearch.search.SearchHit
+import org.opensearch.search.SearchHits
 import org.opensearch.test.OpenSearchTestCase
 
 class MonitorFanOutUtilsTests : OpenSearchTestCase() {
@@ -158,5 +168,190 @@ class MonitorFanOutUtilsTests : OpenSearchTestCase() {
         val pending = mutableMapOf<String, Long>()
         commitPendingSeqNos(pending) { _, _ -> fail("there was nothing to commit") }
         assertTrue(pending.isEmpty())
+    }
+
+    fun `test a shard read to the end with an empty batch is committed at once`() {
+        // None of the documents up to 7000 matched, so nothing is waiting for a percolate search.
+        val pending = mutableMapOf<String, Long>()
+        val committed = mutableMapOf<String, Long>()
+
+        markShardRead("0", 7000L, batchIsEmpty = true, pending) { shard, seqNo -> committed[shard] = seqNo }
+
+        assertEquals(mapOf("0" to 7000L), committed)
+        assertTrue(pending.isEmpty())
+    }
+
+    fun `test a shard committed at once drops the lower sequence number held back for it`() {
+        // The matching documents read from shard 0 gave no document to percolate, so 1200 stayed held back.
+        // A later batch must not commit it over 7000.
+        val pending = mutableMapOf("0" to 1200L, "1" to 300L)
+        val committed = mutableMapOf<String, Long>()
+
+        markShardRead("0", 7000L, batchIsEmpty = true, pending) { shard, seqNo -> committed[shard] = seqNo }
+        commitPendingSeqNos(pending) { shard, seqNo -> committed[shard] = seqNo }
+
+        assertEquals(mapOf("0" to 7000L, "1" to 300L), committed)
+    }
+
+    fun `test a shard read to the end with documents waiting is held back until they are evaluated`() {
+        // Documents up to 1200 matched and wait in the batch; the rest of the shard, up to 7000, did not match.
+        val pending = mutableMapOf("0" to 1200L)
+        val committed = mutableMapOf<String, Long>()
+
+        markShardRead("0", 7000L, batchIsEmpty = false, pending) { shard, seqNo -> committed[shard] = seqNo }
+
+        assertTrue("Nothing is committed before the batch is evaluated", committed.isEmpty())
+        assertEquals(mapOf("0" to 7000L), pending)
+    }
+
+    fun `test an active response monitor reads only the documents that match one of its queries`() {
+        val queries = listOf(
+            DocLevelQuery(id = "blocked-login", name = "blocked-login", fields = listOf(), query = "event.code:\"4625\""),
+            DocLevelQuery(id = "new-service", name = "new-service", fields = listOf("event.action^2"), query = "service-installed")
+        )
+        val monitor = activeResponseMonitor(queries)
+
+        val filter = matchFilterOf(monitor) as BoolQueryBuilder
+
+        assertEquals("1", filter.minimumShouldMatch())
+        assertTrue(filter.must().isEmpty() && filter.filter().isEmpty() && filter.mustNot().isEmpty())
+        val clauses = filter.should().map { it as QueryStringQueryBuilder }
+        assertEquals(listOf("event.code:\"4625\"", "service-installed"), clauses.map { it.queryString() })
+        assertEquals("A query that names no fields searches all of them", mapOf("*" to 1.0f), clauses[0].fields())
+        assertEquals(mapOf("event.action" to 2.0f), clauses[1].fields())
+    }
+
+    fun `test other doc level monitors keep reading every document`() {
+        val monitor = randomDocumentLevelMonitor(
+            inputs = listOf(DocLevelMonitorInput("description", listOf("index"), listOf(randomDocLevelQuery())))
+        )
+        assertNull(matchFilterOf(monitor))
+    }
+
+    fun `test an active response monitor without queries keeps reading every document`() {
+        assertNull(matchFilterOf(activeResponseMonitor(emptyList())))
+    }
+
+    private fun activeResponseMonitor(queries: List<DocLevelQuery>): Monitor =
+        randomDocumentLevelMonitor(
+            inputs = listOf(DocLevelMonitorInput("description", listOf("wazuh-findings-v5-security"), queries))
+        ).copy(monitorType = Monitor.MonitorType.ACTIVE_RESPONSE_MONITOR.value)
+
+    fun `test a percolate search that returned every matched query is not reported`() {
+        assertNull(describePercolateTruncation(percolateHits(returned = 12, total = 12, Relation.EQUAL_TO)))
+    }
+
+    fun `test a percolate search with no match is not reported`() {
+        assertNull(describePercolateTruncation(percolateHits(returned = 0, total = 0, Relation.EQUAL_TO)))
+    }
+
+    fun `test a percolate search capped below its exact total is reported with both counts`() {
+        // 15 queries matched, but the search was sized for 10: five matches would produce no finding.
+        assertEquals(
+            "matched 15 queries but returned only 10",
+            describePercolateTruncation(percolateHits(returned = 10, total = 15, Relation.EQUAL_TO))
+        )
+    }
+
+    fun `test a percolate search whose total is only a lower bound is reported`() {
+        // Past the track_total_hits threshold the total stops counting, so it can equal the number returned.
+        assertEquals(
+            "matched more than the 10 queries it returned",
+            describePercolateTruncation(percolateHits(returned = 10, total = 10, Relation.GREATER_THAN_OR_EQUAL_TO))
+        )
+    }
+
+    fun `test a percolate search without a total is not reported`() {
+        val hits = SearchHits(Array(10) { SearchHit(it) }, null, 1.0f)
+        assertNull(describePercolateTruncation(hits))
+    }
+
+    private fun percolateHits(returned: Int, total: Long, relation: Relation): SearchHits =
+        SearchHits(Array(returned) { SearchHit(it) }, TotalHits(total, relation), 1.0f)
+
+    fun `test one failing document costs only itself and a few searches`() {
+        val percolator = FakePercolator(failing = setOf(4321))
+
+        val isolation = isolate((0 until 50000).toList(), percolator)
+
+        assertEquals(listOf(4321), isolation.failing)
+        assertTrue(isolation.unresolved.isEmpty())
+        assertEquals("every other document is evaluated exactly once", (0 until 50000).toSet() - 4321, percolator.evaluatedOnce())
+        // Two searches per halving: the batch is split 16 times on the way down to the failing document.
+        assertTrue("took ${percolator.searches} searches", percolator.searches <= 2 * 16)
+    }
+
+    fun `test several failing documents are each isolated`() {
+        val percolator = FakePercolator(failing = setOf(0, 517, 518, 999))
+
+        val isolation = isolate((0 until 1000).toList(), percolator)
+
+        assertEquals(listOf(0, 517, 518, 999), isolation.failing)
+        assertTrue(isolation.unresolved.isEmpty())
+        assertEquals((0 until 1000).toSet() - setOf(0, 517, 518, 999), percolator.evaluatedOnce())
+    }
+
+    fun `test a failure that hits every document stops after the cap`() {
+        // Not a few bad values but a defect of the search itself: it must not cost a search per document.
+        val percolator = FakePercolator(failing = (0 until 50000).toSet())
+
+        val isolation = isolate((0 until 50000).toList(), percolator)
+
+        assertTrue(isolation.failing.size <= MAX_ISOLATED_PERCOLATE_FAILURES + 1)
+        assertEquals((0 until 50000).toList(), (isolation.failing + isolation.unresolved).sorted())
+        assertTrue("took ${percolator.searches} searches", percolator.searches <= 100)
+    }
+
+    fun `test a batch of one failing document needs no further search`() {
+        val percolator = FakePercolator(failing = setOf(7))
+
+        val isolation = isolate(listOf(7), percolator)
+
+        assertEquals(listOf(7), isolation.failing)
+        assertEquals(0, percolator.searches)
+    }
+
+    fun `test a failure no part reproduces leaves nothing out`() {
+        // The batch failed as a whole, but every half succeeds on its own.
+        val percolator = FakePercolator(failing = emptySet())
+
+        val isolation = isolate((0 until 100).toList(), percolator)
+
+        assertTrue(isolation.failing.isEmpty())
+        assertTrue(isolation.unresolved.isEmpty())
+        assertEquals((0 until 100).toSet(), percolator.evaluatedOnce())
+    }
+
+    fun `test a part refused for lack of resources is rethrown so the batch is deferred`() {
+        val percolator = FakePercolator(failing = setOf(10), transientAfter = 3)
+
+        expectThrows(IllegalStateException::class.java) { isolate((0 until 100).toList(), percolator) }
+    }
+
+    private fun isolate(docs: List<Int>, percolator: FakePercolator): PercolateIsolation<Int> = runBlocking {
+        percolateIsolatingFailures(docs, MAX_ISOLATED_PERCOLATE_FAILURES, { it is IllegalStateException }) {
+            percolator.percolate(it)
+        }
+    }
+
+    /**
+     * Fails any part holding a document of [failing], like a value the query index cannot hold, and every
+     * search past [transientAfter] with an exception the test classifies as transient.
+     */
+    private class FakePercolator(val failing: Set<Int>, val transientAfter: Int = Int.MAX_VALUE) {
+        var searches = 0
+        private val evaluated = mutableListOf<Int>()
+
+        fun percolate(part: List<Int>) {
+            searches++
+            if (searches > transientAfter) throw IllegalStateException("cancelled")
+            if (part.any { it in failing }) throw IllegalArgumentException("immense term")
+            evaluated += part
+        }
+
+        fun evaluatedOnce(): Set<Int> {
+            assertEquals("a document was evaluated twice", evaluated.size, evaluated.toSet().size)
+            return evaluated.toSet()
+        }
     }
 }

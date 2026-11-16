@@ -10,6 +10,7 @@ import org.apache.logging.log4j.LogManager
 import org.opensearch.ExceptionsHelper
 import org.opensearch.OpenSearchStatusException
 import org.opensearch.ResourceAlreadyExistsException
+import org.opensearch.action.DocWriteResponse
 import org.opensearch.action.admin.indices.alias.Alias
 import org.opensearch.action.admin.indices.create.CreateIndexRequest
 import org.opensearch.action.admin.indices.create.CreateIndexResponse
@@ -25,6 +26,8 @@ import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest
 import org.opensearch.action.bulk.BulkRequest
 import org.opensearch.action.bulk.BulkResponse
 import org.opensearch.action.index.IndexRequest
+import org.opensearch.action.search.SearchRequest
+import org.opensearch.action.search.SearchResponse
 import org.opensearch.action.support.IndicesOptions
 import org.opensearch.action.support.WriteRequest.RefreshPolicy
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse
@@ -46,10 +49,13 @@ import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.rest.RestStatus
 import org.opensearch.index.mapper.MapperService.INDEX_MAPPING_TOTAL_FIELDS_LIMIT_SETTING
+import org.opensearch.index.query.Operator
 import org.opensearch.index.query.QueryBuilders
 import org.opensearch.index.reindex.BulkByScrollResponse
 import org.opensearch.index.reindex.DeleteByQueryAction
 import org.opensearch.index.reindex.DeleteByQueryRequestBuilder
+import org.opensearch.indices.IndicesModule
+import org.opensearch.search.builder.SearchSourceBuilder
 import org.opensearch.transport.client.Client
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -73,6 +79,22 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
          * percolator can parse them (see [transformAbsentFieldQuery]).
          */
         const val ABSENT_FIELD_SENTINEL = "wazuh_absent_field_sentinel"
+
+        /**
+         * Metadata fields such as `_id` and `_index`. No index maps them, yet they are present in every
+         * document, so the absent-field rewrite must leave them alone.
+         */
+        private val METADATA_FIELDS: Set<String> = IndicesModule.getBuiltInMetadataFields()
+
+        /** A quoted value, a regular expression or an escaped character of a `query_string` query. */
+        private val QUERY_LITERAL = Regex("\"(?:\\\\.|[^\"\\\\])*\"|/(?:\\\\.|[^/\\\\])*/|\\\\.")
+
+        /** A field name in a field position: `field:`. */
+        private val FIELD_BEFORE_COLON = Regex("(?<![\\w.@-])([\\w@][\\w.@-]*):")
+
+        /** The field of an `_exists_:field` clause. */
+        private val EXISTS_FIELD = Regex("_exists_:([\\w@][\\w.@-]*)")
+
         @JvmStatic
         fun docLevelQueriesMappings(): String {
             return DocLevelMonitorQueries::class.java.classLoader.getResource("mappings/doc-level-queries.json").readText()
@@ -84,6 +106,9 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             ).build()
         }
     }
+
+    // Wazuh: the queries indexed by scheduled runs, see indexDocLevelQueries.
+    internal val indexedQueries = IndexedQueriesRegistry()
 
     suspend fun initDocLevelQueryIndex(): Boolean {
         if (!docLevelQueryIndexExists()) {
@@ -262,12 +287,21 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         }
     }
 
+    /**
+     * Indexes the queries of [monitor] in its query index, after mapping the fields of its source indices there.
+     *
+     * Wazuh: with [reuseIndexedQueries], a source index whose queries this node already indexed is skipped
+     * while nothing they are built from changed (see [IndexedQueriesState]) and their documents are still in
+     * the query index. Scheduled runs pass it: indexing the same queries again on every run costs about
+     * 10 ms per query, also when no document arrived.
+     */
     suspend fun indexDocLevelQueries(
         monitor: Monitor,
         monitorId: String,
         monitorMetadata: MonitorMetadata,
         refreshPolicy: RefreshPolicy = RefreshPolicy.IMMEDIATE,
-        indexTimeout: TimeValue
+        indexTimeout: TimeValue,
+        reuseIndexedQueries: Boolean = false
     ) {
         val docLevelMonitorInput = monitor.inputs[0] as DocLevelMonitorInput
         val queries: List<DocLevelQuery> = docLevelMonitorInput.queries
@@ -277,6 +311,8 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         // Every source index of this monitor resolves the same queryIndex alias, so once the alias is known to
         // be unresolvable there is no point in paying the retry delay again for each remaining source index.
         val queryIndexResolver = QueryIndexWriteIndexResolver()
+        // Wazuh: the query documents of this monitor, once every source index has been handled, to delete the others.
+        val currentQueries = CurrentQueryDocs()
 
         // Run through each backing index and apply appropriate mappings to query index
         indices.forEach { indexName ->
@@ -300,6 +336,16 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                 }
             }
             val updatedIndexName = indexName.replace("*", "_")
+            // Wazuh: nothing to do for a source index whose queries are indexed and current.
+            val alreadyIndexed = if (reuseIndexedQueries) {
+                queriesAlreadyIndexed(monitor, monitorId, monitorMetadata, updatedIndexName, concreteIndices, clusterState)
+            } else {
+                null
+            }
+            if (alreadyIndexed != null) {
+                currentQueries.add(alreadyIndexed.state.queryIndex, alreadyIndexed.docIds)
+                return@forEach
+            }
             val updatedProperties = mutableMapOf<String, Any>()
             val allFlattenPaths = mutableSetOf<Pair<String, String>>()
             var sourceIndexFieldLimit = 0L
@@ -382,8 +428,9 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                 queryIndexResolver
             )
 
+            var indexedDocs: IndexedQueryDocs? = null
             if (updateMappingResponse.isAcknowledged) {
-                doIndexAllQueries(
+                indexedDocs = doIndexAllQueries(
                     concreteQueryIndex,
                     updatedIndexName,
                     monitorId,
@@ -394,10 +441,152 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     indexTimeout
                 )
             }
+            // Wazuh: remember what the queries were built from, only when every one of them was indexed.
+            if (reuseIndexedQueries) {
+                if (indexedDocs != null) {
+                    val state = IndexedQueriesState.of(monitor, concreteIndices, concreteQueryIndex, indexedDocs.queryIndexUuid, clusterState)
+                    indexedQueries.put(monitorId, updatedIndexName, IndexedQueries(state, indexedDocs.docIds))
+                    currentQueries.add(concreteQueryIndex, indexedDocs.docIds, indexed = true)
+                } else {
+                    indexedQueries.remove(monitorId, updatedIndexName)
+                    currentQueries.unknown()
+                }
+            }
+        }
+        // Wazuh: once the queries are indexed again, the documents of queries the monitor no longer lists go.
+        // Not when every source index was skipped, which keeps such a run free of index requests.
+        if (reuseIndexedQueries && currentQueries.complete && currentQueries.indexed) {
+            deleteUnlistedQueries(monitorId, currentQueries.queryIndices, currentQueries.docIds)
         }
     }
 
-    private suspend fun doIndexAllQueries(
+    /** Wazuh: the query documents of a monitor that indexDocLevelQueries indexed or found current, by query index. */
+    private class CurrentQueryDocs {
+        val queryIndices = mutableSetOf<String>()
+        val docIds = mutableSetOf<String>()
+
+        /** False when the documents of a source index are not known, for example after a failed bulk item. */
+        var complete = true
+            private set
+
+        /** True when the queries of a source index were indexed by this call. */
+        var indexed = false
+            private set
+
+        fun add(queryIndex: String, ids: Set<String>, indexed: Boolean = false) {
+            queryIndices.add(queryIndex)
+            docIds.addAll(ids)
+            if (indexed) this.indexed = true
+        }
+
+        fun unknown() {
+            complete = false
+        }
+    }
+
+    /**
+     * Wazuh: deletes from [queryIndices] the query documents of [monitorId] other than [docIds].
+     *
+     * An update of a monitor deletes its query documents before indexing the new ones, but a run of the
+     * previous version still in flight can index the previous queries again after that, and runs only add
+     * documents. Those queries stayed for good, and a match of any of them failed every run
+     * (wazuh/wazuh-indexer#2105). A failure here is logged and leaves them for the next time. Internal, not
+     * private, for UnlistedQueriesTests.
+     */
+    internal suspend fun deleteUnlistedQueries(monitorId: String, queryIndices: Set<String>, docIds: Set<String>) {
+        if (queryIndices.isEmpty()) return
+        val unlisted = QueryBuilders.boolQuery()
+            .filter(QueryBuilders.matchQuery("monitor_id", monitorId).operator(Operator.AND))
+            .mustNot(QueryBuilders.idsQuery().addIds(*docIds.toTypedArray()))
+        try {
+            val response: BulkByScrollResponse = suspendCoroutine { cont ->
+                DeleteByQueryRequestBuilder(client, DeleteByQueryAction.INSTANCE)
+                    .source(*queryIndices.toTypedArray())
+                    .filter(unlisted)
+                    .refresh(true)
+                    .execute(
+                        object : ActionListener<BulkByScrollResponse> {
+                            override fun onResponse(response: BulkByScrollResponse) = cont.resume(response)
+                            override fun onFailure(t: Exception) = cont.resumeWithException(t)
+                        }
+                    )
+            }
+            if (response.deleted > 0) {
+                log.info("Monitor $monitorId: deleted ${response.deleted} query documents of queries it no longer lists from $queryIndices")
+            }
+            response.bulkFailures.forEach {
+                log.debug("Monitor $monitorId: could not delete the query document [${it.id}]: ${it.cause}")
+            }
+        } catch (e: Exception) {
+            val message = "Monitor $monitorId: could not delete the query documents of queries it no longer lists from $queryIndices"
+            if (isNodeUnavailableFailure(e)) log.debug(message, e) else log.warn(message, e)
+        }
+    }
+
+    /**
+     * Wazuh: the [IndexedQueries] when this node already indexed the queries of [monitor] for [sourceIndex], from the same
+     * monitor, source index mappings and query index, and their documents are still there, null otherwise. Internal, not
+     * private, for IndexedQueriesTests.
+     */
+    internal suspend fun queriesAlreadyIndexed(
+        monitor: Monitor,
+        monitorId: String,
+        monitorMetadata: MonitorMetadata,
+        sourceIndex: String,
+        concreteIndices: List<String>,
+        clusterState: ClusterState
+    ): IndexedQueries? {
+        val indexed = indexedQueries.get(monitorId, sourceIndex) ?: return null
+        // The fan-out percolates against the query index of the metadata: no entry, no queries.
+        val queryIndex = monitorMetadata.sourceToQueryIndexMapping[sourceIndex + monitor.id] ?: return null
+        // updateQueryIndexMappings moves such a monitor to the current write index of its query index alias.
+        if (
+            queryIndex != monitor.dataSources.queryIndex &&
+            monitor.deleteQueryIndexInEveryRun == true &&
+            getWriteIndexNameForAlias(monitor.dataSources.queryIndex) != queryIndex
+        ) {
+            return null
+        }
+        val queryIndexUuid = clusterState.metadata.indicesLookup[queryIndex]?.writeIndex?.indexUUID ?: return null
+        if (indexed.state != IndexedQueriesState.of(monitor, concreteIndices, queryIndex, queryIndexUuid, clusterState)) {
+            return null
+        }
+        // Their documents can be deleted without the monitor changing, for example by a failed update of the monitor.
+        val found = countQueryDocs(queryIndex, indexed.docIds)
+        if (found != indexed.docIds.size.toLong()) {
+            log.debug(
+                "Monitor $monitorId: $found of the ${indexed.docIds.size} queries of [$sourceIndex] found in " +
+                    "[$queryIndex]. Indexing them again."
+            )
+            return null
+        }
+        log.debug("Monitor $monitorId: the ${indexed.docIds.size} queries of [$sourceIndex] are indexed and current in [$queryIndex]")
+        return indexed
+    }
+
+    /**
+     * Wazuh: how many of the documents [docIds] the query index [queryIndex] holds, or -1 when it cannot be
+     * told: the queries are then indexed again, as they were before this check existed.
+     */
+    private suspend fun countQueryDocs(queryIndex: String, docIds: Set<String>): Long {
+        val request = SearchRequest(queryIndex).source(
+            SearchSourceBuilder().size(0).trackTotalHits(true).query(QueryBuilders.idsQuery().addIds(*docIds.toTypedArray()))
+        )
+        return try {
+            val response: SearchResponse = client.suspendUntil { search(request, it) }
+            response.hits.totalHits?.value ?: -1L
+        } catch (e: Exception) {
+            log.debug("Could not count the queries in [$queryIndex]", e)
+            -1L
+        }
+    }
+
+    /** Wazuh: forgets the queries [monitorId] indexed, so that its next run indexes them again. */
+    fun forgetIndexedQueries(monitorId: String) = indexedQueries.forget(monitorId)
+
+    // Wazuh: internal, not private, so that DocLevelMonitorQueriesTests can check the queries it indexes.
+    // Returns the documents written when every query was indexed, and null otherwise.
+    internal suspend fun doIndexAllQueries(
         concreteQueryIndex: String,
         sourceIndex: String,
         monitorId: String,
@@ -406,7 +595,7 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         conflictingPaths: Set<String>,
         refreshPolicy: RefreshPolicy,
         indexTimeout: TimeValue
-    ) {
+    ): IndexedQueryDocs? {
         val indexRequests = mutableListOf<IndexRequest>()
         val conflictingPathToConcreteIndices = mutableMapOf<String, MutableSet<String>>()
         flattenPaths.forEach { fieldPath ->
@@ -427,6 +616,10 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         queries.forEach {
             val filteredConcreteIndices = mutableSetOf<String>()
             var query = it.query
+            // Wazuh: the fields the absent-field rewrite below checks. A query without field names, such
+            // as a Security Analytics rule that also matches a keyword in any field, still names fields
+            // in its text (wazuh/wazuh-indexer-plugins#1747). Read from the query before any rename.
+            val fieldNames = it.queryFieldNames.ifEmpty { fieldNamesIn(it.query).toList() }
             conflictingPaths.forEach { conflictingPath ->
                 if (query.contains(conflictingPath)) {
                     query = transformExistsQuery(query, conflictingPath, "<index>", monitorId)
@@ -439,12 +632,13 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                 filteredConcreteIndices.forEach { filteredConcreteIndex ->
                     val newQuery = it.copy(
                         id = "${it.id}_$filteredConcreteIndex",
-                        query = query.replace("<index>", filteredConcreteIndex)
+                        query = query.replace("<index>", filteredConcreteIndex),
+                        queryFieldNames = fieldNames
                     )
                     newQueries.add(newQuery)
                 }
             } else {
-                newQueries.add(it.copy(id = "${it.id}_$sourceIndex"))
+                newQueries.add(it.copy(id = "${it.id}_$sourceIndex", queryFieldNames = fieldNames))
             }
         }
 
@@ -458,7 +652,10 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     query = query.replace("${fieldPath.first}:", "${fieldPath.first}_${sourceIndex}_$monitorId:")
                 }
             }
-            query = transformAbsentFieldQuery(query, it.queryFieldNames.filterNot { f -> mappedPaths.contains(f) })
+            query = transformAbsentFieldQuery(
+                query,
+                it.queryFieldNames.filterNot { f -> mappedPaths.contains(f) || METADATA_FIELDS.contains(f) }
+            )
             val indexRequest = IndexRequest(concreteQueryIndex)
                 .id(it.id + "_$monitorId")
                 .source(
@@ -492,7 +689,15 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     }
                 }
             }
+            if (!bulkResponse.hasFailures()) {
+                // Wazuh: the concrete index behind the query index alias is read from the responses.
+                val queryIndexUuid = bulkResponse.items.mapTo(mutableSetOf()) { it.getResponse<DocWriteResponse>().shardId.index.uuid }.singleOrNull()
+                if (queryIndexUuid != null) {
+                    return IndexedQueryDocs(queryIndexUuid, indexRequests.mapTo(mutableSetOf()) { it.id() })
+                }
+            }
         }
+        return null
     }
 
     /**
@@ -543,6 +748,22 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             transformed = transformed.replace(Regex("(?<=_exists_:)$name(?![\\w.])"), ABSENT_FIELD_SENTINEL)
         }
         return transformed
+    }
+
+    /**
+     * Gives the field names a `query_string` query refers to: the names before a `:` and the names after
+     * `_exists_:`.
+     *
+     * Quoted values, regular expressions and escaped characters are skipped, so a `:` inside a matched
+     * value is not read as a field. A term with no field, such as `"DataError"`, names none.
+     */
+    internal fun fieldNamesIn(query: String): Set<String> {
+        val masked = query.replace(QUERY_LITERAL, " ").replace("_exists_: ", "_exists_:")
+        val names = mutableSetOf<String>()
+        FIELD_BEFORE_COLON.findAll(masked).forEach { names.add(it.groupValues[1]) }
+        EXISTS_FIELD.findAll(masked).forEach { names.add(it.groupValues[1]) }
+        names.remove("_exists_")
+        return names
     }
 
     private suspend fun updateQueryIndexMappings(

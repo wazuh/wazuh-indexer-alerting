@@ -24,15 +24,22 @@ import org.opensearch.action.bulk.BulkResponse
 import org.opensearch.action.fieldcaps.FieldCapabilitiesRequest
 import org.opensearch.action.index.IndexRequest
 import org.opensearch.action.search.SearchRequest
+import org.opensearch.action.support.PlainActionFuture
 import org.opensearch.action.support.WriteRequest
 import org.opensearch.alerting.alerts.AlertIndices
 import org.opensearch.alerting.core.ScheduledJobIndices
+import org.opensearch.alerting.core.lock.LockModel
+import org.opensearch.alerting.core.lock.LockService
+import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.alerting.transport.AlertingSingleNodeTestCase
 import org.opensearch.alerting.util.DocLevelMonitorQueries
 import org.opensearch.alerting.util.DocLevelMonitorQueries.Companion.INDEX_PATTERN_SUFFIX
 import org.opensearch.alerting.workflow.CompositeWorkflowRunner
 import org.opensearch.cluster.metadata.IndexMetadata
+import org.opensearch.cluster.metadata.Metadata
+import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
+import org.opensearch.common.unit.TimeValue
 import org.opensearch.common.xcontent.LoggingDeprecationHandler
 import org.opensearch.common.xcontent.XContentHelper
 import org.opensearch.common.xcontent.XContentType
@@ -414,8 +421,37 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
                 fields = listOf(),
                 queryFieldNames = listOf("alias.some.fff", "source.ip.v6.v1")
             )
+        val docQuery8 = DocLevelQuery(
+            query = "message:error",
+            name = "10",
+            fields = listOf()
+        )
+        val docQuery9 = DocLevelQuery(
+            query = "message:IAD",
+            name = "11",
+            fields = listOf()
+        )
+        val docQuery10 = DocLevelQuery(
+            query = "source.ip.v6.v1:[10000 TO 20000]",
+            name = "12",
+            fields = listOf()
+        )
+        val docQuery11 = DocLevelQuery(
+            query = "type.subtype:some",
+            name = "13",
+            fields = listOf()
+        )
+        val docQuery12 = DocLevelQuery(
+            query = "supertype.type:some",
+            name = "14",
+            fields = listOf()
+        )
         val docLevelInput = DocLevelMonitorInput(
-            "description", listOf(index), listOf(docQuery1, docQuery2, docQuery3, docQuery4, docQuery5, docQuery6, docQuery7)
+            "description", listOf(index),
+            listOf(
+                docQuery1, docQuery2, docQuery3, docQuery4, docQuery5, docQuery6, docQuery7,
+                docQuery8, docQuery9, docQuery10, docQuery11, docQuery12
+            )
         )
         val trigger = randomDocumentLevelTrigger(condition = ALWAYS_RUN)
         val customFindingsIndex = "custom_findings_index"
@@ -438,7 +474,7 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
             "source.ip.v6.v1" : 12345,
             "source.ip.v6.v2" : 16645,
             "source.ip.v4.v0" : 120,
-            "test_bad_char" : "\u0000", 
+            "test_bad_char" : "\u0000",
             "test_strict_date_time" : "$testTime",
             "test_field.some_other_field" : "us-west-2",
             "type.subtype" : "some subtype",
@@ -464,7 +500,56 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         val findings = searchFindings(id, customFindingsIndex)
         assertEquals("Findings saved for test monitor", 1, findings.size)
         assertTrue("Findings saved for test monitor", findings[0].relatedDocIds.contains("1"))
-        assertEquals("Didn't match all 7 queries", 7, findings[0].docLevelQueries.size)
+        assertEquals("Didn't match all 12 queries", 12, findings[0].docLevelQueries.size)
+    }
+
+    fun `test every document gets a finding when more than 10 queries match in one run`() {
+        // Each document matches exactly one query, so the run's percolate search has one hit per query. Left
+        // at its default size, that search returned only 10 hits, and the other documents got no finding.
+        val matchCount = 15
+        val docLevelInput = DocLevelMonitorInput(
+            "description", listOf(index),
+            (1..matchCount).map { n -> DocLevelQuery(query = "test_field_1:\"value_$n\"", name = "$n", fields = listOf()) }
+        )
+        val customFindingsIndex = "custom_findings_index"
+        var monitor = randomDocumentLevelMonitor(
+            inputs = listOf(docLevelInput),
+            triggers = listOf(randomDocumentLevelTrigger(condition = ALWAYS_RUN)),
+            dataSources = DataSources(
+                queryIndex = "custom_alerts_index",
+                findingsIndex = customFindingsIndex,
+                findingsIndexPattern = "custom_findings_index-1"
+            )
+        )
+        val monitorResponse = createMonitor(monitor)
+        assertFalse(monitorResponse?.id.isNullOrEmpty())
+        monitor = monitorResponse!!.monitor
+        val id = monitorResponse.id
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        (1..matchCount).forEach { n ->
+            indexDoc(index, "$n", """{ "test_field_1": "value_$n", "test_strict_date_time": "$testTime" }""")
+        }
+
+        val executeMonitorResponse = executeMonitor(monitor, id, false)
+        assertNull(executeMonitorResponse!!.monitorRunResult.error)
+        val matchedQueries = executeMonitorResponse.monitorRunResult.inputResults.results[0]
+        assertEquals("Not every matching query was returned by the percolate search", matchCount, matchedQueries.size)
+
+        // The shared search helpers fetch only 10 hits, so count with an explicit size.
+        refreshIndex(customFindingsIndex)
+        val findingsResponse = client().prepareSearch(customFindingsIndex)
+            .setSource(SearchSourceBuilder().size(100).query(TermQueryBuilder(Alert.MONITOR_ID_FIELD, id)))
+            .get()
+        assertEquals("Every document should have a finding", matchCount.toLong(), findingsResponse.hits.totalHits!!.value)
+        assertEquals(matchCount, findingsResponse.hits.hits.size)
+
+        val getAlertsResponse = client()
+            .execute(
+                AlertingActions.GET_ALERTS_ACTION_TYPE,
+                GetAlertsRequest(Table("asc", "id", null, 100, 0, ""), "ALL", "ALL", id, null)
+            )
+            .get()
+        assertEquals("Every document should have an alert", matchCount, getAlertsResponse.alerts.size)
     }
 
     fun `test percolate query failure when queryFieldNames has alias`() {
@@ -1280,6 +1365,57 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         searchAlerts(id)
         val mapping = client().admin().indices().getMappings(GetMappingsRequest().indices(customQueryIndex)).get()
         Assert.assertTrue(mapping.toString().contains("\"analyzer\":\"$analyzer\""))
+    }
+
+    fun `test a document the query index cannot hold costs only itself, not its batch`() {
+        // The `keyword` analyzer makes the query index copy of `message` a single term, and Lucene refuses a
+        // term longer than 32766 bytes. The percolate search over both documents fails because of the long one.
+        val docQuery = DocLevelQuery(query = "test_field_1:\"us-west-2\"", name = "3", fields = listOf())
+        val docLevelInput = DocLevelMonitorInput("description", listOf(index), listOf(docQuery))
+        val trigger = randomDocumentLevelTrigger(condition = ALWAYS_RUN)
+        var monitor = randomDocumentLevelMonitor(
+            inputs = listOf(docLevelInput),
+            triggers = listOf(trigger),
+            dataSources = DataSources(
+                queryIndex = "custom_query_index",
+                queryIndexMappingsByType = mapOf(Pair("text", mapOf(Pair("analyzer", "keyword")))),
+            )
+        )
+        val monitorResponse = createMonitor(monitor)
+        assertFalse(monitorResponse?.id.isNullOrEmpty())
+        monitor = monitorResponse!!.monitor
+        val id = monitorResponse.id
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        indexDoc(
+            index,
+            "long",
+            """{"message": "${"A".repeat(40000)}", "test_strict_date_time": "$testTime", "test_field_1": "us-west-2"}"""
+        )
+        indexDoc(
+            index,
+            "short",
+            """{"message": "This is an error from IAD region", "test_strict_date_time": "$testTime", "test_field_1": "us-west-2"}"""
+        )
+
+        val executeMonitorResponse = executeMonitor(monitor, id, false)
+
+        val docLevelTrigger = executeMonitorResponse!!.monitorRunResult.triggerResults.values.single() as DocumentLevelTriggerRunResult
+        assertEquals(
+            "the document percolated with the long one must still be evaluated",
+            listOf("short"),
+            docLevelTrigger.triggeredDocs.map { it.split("|")[0] }
+        )
+        val getAlertsResponse = client()
+            .execute(
+                AlertingActions.GET_ALERTS_ACTION_TYPE,
+                GetAlertsRequest(Table("asc", "id", null, 10, 0, ""), "ALL", "ALL", id, null)
+            )
+            .get()
+        val errorMessages = getAlertsResponse.alerts.mapNotNull { it.errorMessage }
+        assertTrue(
+            "only the long document is reported as not evaluated: $errorMessages",
+            errorMessages.any { it.contains("1 document(s) abandoned") }
+        )
     }
 
     fun `test delete monitor deletes all queries and metadata too`() {
@@ -6561,5 +6697,125 @@ class MonitorDataSourcesIT : AlertingSingleNodeTestCase() {
         monitorMetadata = searchMonitorMetadata("${monitorResponse.id}-metadata")
         val lastRunContextAfterEnable = (monitorMetadata?.lastRunContext?.get(index) as? Map<String, Any>)
         assertEquals(3, lastRunContextAfterEnable?.get("0"))
+    }
+
+    // Every hidden index the plugin creates must keep a copy on another node, or losing the node that holds its
+    // primary turns the cluster red. `index.auto_expand_replicas: 0-1` gives no replica on a single node, which keeps
+    // it green, and one replica as soon as a second node joins. These tests live here because a second
+    // AlertingSingleNodeTestCase subclass breaks the node setup of the other one in the same test JVM.
+    fun `test indices of a monitor with Security Analytics data sources auto expand replicas`() {
+        val dataSources = DataSources(
+            queryIndex = ".opensearch-sap-test-detectors-queries",
+            alertsIndex = ".opensearch-sap-test-alerts",
+            alertsHistoryIndex = ".opensearch-sap-test-alerts-history",
+            alertsHistoryIndexPattern = "<.opensearch-sap-test-alerts-history-{now/d}-1>",
+            findingsIndex = ".opensearch-sap-test-findings",
+            findingsIndexPattern = "<.opensearch-sap-test-findings-{now/d}-1>"
+        )
+
+        createAndRunMonitor(index, dataSources)
+
+        val metadata = clusterMetadata()
+        assertAutoExpandReplicas(metadata, listOf(ScheduledJob.SCHEDULED_JOBS_INDEX, dataSources.alertsIndex))
+        assertAutoExpandReplicas(metadata, indicesBehind(metadata, dataSources.queryIndex))
+        assertAutoExpandReplicas(metadata, indicesBehind(metadata, dataSources.alertsHistoryIndex!!))
+        assertAutoExpandReplicas(metadata, indicesBehind(metadata, dataSources.findingsIndex))
+    }
+
+    fun `test default indices auto expand replicas after a rollover`() {
+        val rolloverSettings = listOf(
+            AlertingSettings.ALERT_HISTORY_ROLLOVER_PERIOD,
+            AlertingSettings.ALERT_HISTORY_INDEX_MAX_AGE,
+            AlertingSettings.FINDING_HISTORY_ROLLOVER_PERIOD,
+            AlertingSettings.FINDING_HISTORY_INDEX_MAX_AGE
+        ).map { it.key }
+        updateClusterSettings(Settings.builder().apply { rolloverSettings.forEach { put(it, "1s") } }.build())
+        try {
+            // A source index with close to 10000 mapped fields fills the query index, so the queries of the second
+            // monitor go to a new one created by a rollover.
+            val sourceIndex = "replicas_source_index"
+            createIndex(sourceIndex, Settings.builder().put("index.mapping.total_fields.limit", "10000").build())
+            val doc = StringBuilder("{")
+            for (i in 1..3300) {
+                doc.append(""" "id$i.somefield.somefield$i":$i,""")
+            }
+            doc.append("\"test_field\" : \"us-west-2\" }")
+            indexDoc(sourceIndex, "1", doc.toString())
+
+            createAndRunMonitor(sourceIndex, DataSources())
+            createAndRunMonitor(sourceIndex, DataSources())
+
+            assertTrue(
+                "the alert and finding history indices were not rolled over",
+                OpenSearchTestCase.waitUntil({
+                    val metadata = clusterMetadata()
+                    indicesBehind(metadata, AlertIndices.ALERT_HISTORY_ALL).size >= 2 &&
+                        indicesBehind(metadata, AlertIndices.FINDING_HISTORY_ALL).size >= 2
+                }, 30, TimeUnit.SECONDS)
+            )
+
+            val metadata = clusterMetadata()
+            val queryIndices = indicesBehind(metadata, ScheduledJob.DOC_LEVEL_QUERIES_INDEX + "*")
+            assertTrue(
+                "the query index was not rolled over: $queryIndices",
+                queryIndices.contains(ScheduledJob.DOC_LEVEL_QUERIES_INDEX + "-000002")
+            )
+            assertAutoExpandReplicas(metadata, queryIndices)
+            assertAutoExpandReplicas(metadata, listOf(AlertIndices.ALERT_INDEX))
+            assertAutoExpandReplicas(metadata, indicesBehind(metadata, AlertIndices.ALERT_HISTORY_ALL))
+            assertAutoExpandReplicas(metadata, indicesBehind(metadata, AlertIndices.FINDING_HISTORY_ALL))
+        } finally {
+            updateClusterSettings(Settings.builder().apply { rolloverSettings.forEach { putNull(it) } }.build())
+        }
+    }
+
+    fun `test lock index auto expands replicas`() {
+        val lockService = LockService(client(), getInstanceFromNode(ClusterService::class.java))
+        val lock = PlainActionFuture.newFuture<LockModel?>()
+
+        lockService.acquireLockWithId("internal-index-replicas", lock)
+        lock.actionGet(TimeValue.timeValueSeconds(30))
+
+        assertAutoExpandReplicas(clusterMetadata(), listOf(LockService.LOCK_INDEX_NAME))
+    }
+
+    private fun createAndRunMonitor(sourceIndex: String, dataSources: DataSources) {
+        val docQuery = DocLevelQuery(query = "test_field:\"us-west-2\"", name = "3", fields = listOf())
+        val monitor = randomDocumentLevelMonitor(
+            inputs = listOf(DocLevelMonitorInput("description", listOf(sourceIndex), listOf(docQuery))),
+            triggers = listOf(randomDocumentLevelTrigger(condition = ALWAYS_RUN)),
+            dataSources = dataSources
+        )
+        val monitorResponse = createMonitor(monitor)!!
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        indexDoc(sourceIndex, randomAlphaOfLength(10), """{ "test_strict_date_time": "$testTime", "test_field": "us-west-2" }""")
+        executeMonitor(monitorResponse.monitor, monitorResponse.id, false)
+    }
+
+    private fun clusterMetadata(): Metadata = client().admin().cluster().prepareState().get().state.metadata
+
+    /** Concrete indices of an index name, alias or wildcard pattern, including hidden ones. */
+    private fun indicesBehind(metadata: Metadata, expression: String): List<String> {
+        val regex = Regex(expression.split("*").joinToString(".*") { Regex.escape(it) })
+        return metadata.indicesLookup.filterKeys { regex.matches(it) }.values
+            .flatMap { abstraction -> abstraction.indices.map { it.index.name } }
+            .distinct()
+    }
+
+    private fun assertAutoExpandReplicas(metadata: Metadata, indices: List<String>) {
+        assertFalse("expected at least one index", indices.isEmpty())
+        indices.forEach { index ->
+            val indexMetadata = metadata.index(index)
+            assertNotNull("index [$index] does not exist", indexMetadata)
+            assertEquals(
+                "index.auto_expand_replicas of [$index]",
+                "0-1",
+                indexMetadata!!.settings.get(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS)
+            )
+        }
+    }
+
+    private fun updateClusterSettings(settings: Settings) {
+        client().admin().cluster().prepareUpdateSettings().setPersistentSettings(settings).get()
     }
 }
