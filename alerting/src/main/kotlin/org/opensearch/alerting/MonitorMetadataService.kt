@@ -28,7 +28,9 @@ import org.opensearch.action.support.WriteRequest
 import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.alerting.util.IndexUtils
+import org.opensearch.alerting.util.reapplyMetadataUpdate
 import org.opensearch.alerting.util.wrapKeepingNodeUnavailableCause
+import org.opensearch.alerting.util.writeMetadataReapplyingOnConflict
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
 import org.opensearch.common.unit.TimeValue
@@ -53,6 +55,9 @@ import org.opensearch.transport.RemoteTransportException
 import org.opensearch.transport.client.Client
 
 private val log = LogManager.getLogger(MonitorMetadataService::class.java)
+
+/** Writes an index monitor or index workflow request makes before giving up on a metadata document that keeps moving. */
+private const val MAX_UPDATE_WRITE_ATTEMPTS = 5
 
 object MonitorMetadataService :
     CoroutineScope by CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineName("MonitorMetadataService")) {
@@ -102,6 +107,31 @@ object MonitorMetadataService :
             throw wrapKeepingNodeUnavailableCause(e)
         }
     }
+
+    /**
+     * Stores the metadata an index monitor or index workflow request computed ([update]) from the copy it read
+     * at its start ([base]). A monitor run can checkpoint the same document while the request indexes the
+     * queries, so on a version conflict the stored copy is read again, the request's change is re-applied on
+     * top of it ([reapplyMetadataUpdate]) and the write retried, instead of failing the request.
+     *
+     * @param resetRunContext the request rebuilt the run context from scratch (the monitor or workflow was
+     *   re-enabled), so [update]'s run context replaces the stored one instead of being merged into it.
+     */
+    suspend fun upsertMetadataReapplyingOnConflict(
+        monitor: Monitor,
+        workflowMetadataId: String?,
+        base: MonitorMetadata,
+        update: MonitorMetadata,
+        resetRunContext: Boolean,
+    ): MonitorMetadata =
+        // The write and the read already convert their failures; do not wrap them again.
+        writeMetadataReapplyingOnConflict(
+            update,
+            MAX_UPDATE_WRITE_ATTEMPTS,
+            write = { upsertMetadataUnlessConflicting(it) },
+            read = { getMetadata(monitor, workflowMetadataId) },
+            reapply = { current -> reapplyMetadataUpdate(current, base, update, resetRunContext) }
+        )
 
     @Suppress("ComplexMethod", "ReturnCount")
     private suspend fun writeMetadata(metadata: MonitorMetadata, updating: Boolean): MonitorMetadata {

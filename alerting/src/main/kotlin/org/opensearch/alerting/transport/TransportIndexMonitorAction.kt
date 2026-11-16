@@ -51,6 +51,7 @@ import org.opensearch.alerting.util.getRoleFilterEnabled
 import org.opensearch.alerting.util.isADMonitor
 import org.opensearch.alerting.util.storedForm
 import org.opensearch.alerting.util.use
+import org.opensearch.alerting.util.withOwnQueryIndexMapping
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.inject.Inject
 import org.opensearch.common.settings.Settings
@@ -606,6 +607,8 @@ class TransportIndexMonitorAction @Inject constructor(
                     throw t
                 }
                 try {
+                    // Indexing the queries updates the mapping in place: keep what was read to re-apply the change on a conflict.
+                    val readMetadata = metadata.withOwnQueryIndexMapping()
                     if (request.monitor.isMonitorOfStandardType()) {
                         val type = Monitor.MonitorType.valueOf(request.monitor.monitorType.uppercase(Locale.ROOT))
                         if (
@@ -615,8 +618,15 @@ class TransportIndexMonitorAction @Inject constructor(
                             indexDocLevelMonitorQueries(request.monitor, indexResponse.id, metadata, request.refreshPolicy)
                         }
                     }
-                    // When inserting queries in queryIndex we could update sourceToQueryIndexMapping
-                    MonitorMetadataService.upsertMetadata(metadata, updating = true)
+                    // When inserting queries in queryIndex we could update sourceToQueryIndexMapping.
+                    // A first run of the new monitor can checkpoint the same document meanwhile.
+                    MonitorMetadataService.upsertMetadataReapplyingOnConflict(
+                        request.monitor,
+                        workflowMetadataId = null,
+                        base = readMetadata,
+                        update = metadata,
+                        resetRunContext = false
+                    )
                 } catch (t: Exception) {
                     log.error("failed to index doc level queries monitor ${indexResponse.id}. deleting monitor", t)
                     cleanupMonitorAfterPartialFailure(request.monitor, indexResponse)
@@ -786,6 +796,8 @@ class TransportIndexMonitorAction @Inject constructor(
                     currentMonitor.isMonitorOfStandardType() &&
                     Monitor.MonitorType.valueOf(currentMonitor.monitorType.uppercase(Locale.ROOT)) == Monitor.MonitorType.DOC_LEVEL_MONITOR
                 ) {
+                    // Indexing the queries updates the mapping in place: keep what was read to re-apply the change on a conflict.
+                    val readMetadata = metadata.withOwnQueryIndexMapping()
                     updatedMetadata = MonitorMetadataService.recreateRunContext(metadata, currentMonitor)
                     val runContextGainedIndices = updatedMetadata.lastRunContext != metadata.lastRunContext
 
@@ -810,9 +822,16 @@ class TransportIndexMonitorAction @Inject constructor(
                     }
 
                     // Write only when something changed: every write makes a running monitor's checkpoint
-                    // write conflict.
+                    // write conflict. A run can also checkpoint the document while the queries are re-indexed:
+                    // re-apply this update on top of it rather than failing the update.
                     if (isDocLevelMonitorRestarted || queriesChanged || runContextGainedIndices) {
-                        MonitorMetadataService.upsertMetadata(updatedMetadata, updating = true)
+                        MonitorMetadataService.upsertMetadataReapplyingOnConflict(
+                            request.monitor,
+                            workflowMetadataId = null,
+                            base = readMetadata,
+                            update = updatedMetadata,
+                            resetRunContext = isDocLevelMonitorRestarted
+                        )
                     }
                 }
                 actionListener.onResponse(

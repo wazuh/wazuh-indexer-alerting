@@ -391,7 +391,12 @@ class AlertIndices(
         logger.debug("index: [$index] schema mappings: [$schemaMapping]")
         val request = CreateIndexRequest(index)
             .mapping(schemaMapping)
-            .settings(Settings.builder().put("index.hidden", true).build())
+            .settings(
+                Settings.builder()
+                    .put("index.hidden", true)
+                    .put(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS, "0-1")
+                    .build()
+            )
 
         if (alias != null) request.alias(Alias(alias))
         return try {
@@ -464,7 +469,12 @@ class AlertIndices(
         val request = RolloverRequest(index, null)
         request.createIndexRequest.index(pattern)
             .mapping(map)
-            .settings(Settings.builder().put("index.hidden", true).build())
+            .settings(
+                Settings.builder()
+                    .put("index.hidden", true)
+                    .put(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS, "0-1")
+                    .build()
+            )
         request.addMaxIndexDocsCondition(docsCondition)
         request.addMaxIndexAgeCondition(ageCondition)
         client.admin().indices().rolloverIndex(
