@@ -102,8 +102,14 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         /** The values of `dynamic` under which an index applies its dynamic templates to a new field. */
         private val DYNAMIC_WITH_TEMPLATES = setOf("true", "strict_allow_templates", "false_allow_templates")
 
-        /** The placeholders a dynamic template fills from the document, so its mapping is not known before one arrives. */
-        private val TEMPLATE_PLACEHOLDERS = listOf("{name}", "{dynamic_type}")
+        /**
+         * The placeholders a dynamic template fills from the document, so its mapping is not known before one arrives.
+         * `{dynamicType}` is the older spelling of `{dynamic_type}`, which OpenSearch still fills.
+         */
+        private val TEMPLATE_PLACEHOLDERS = listOf("{name}", "{dynamic_type}", "{dynamicType}")
+
+        /** The field of a query that the query index refused because it has no mapping for it. */
+        private val NO_FIELD_MAPPING = Regex("No field mapping can be found for the field with name \\[([^\\]]*)]")
 
         @JvmStatic
         fun docLevelQueriesMappings(): String {
@@ -627,6 +633,8 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         }
 
         val newQueries = mutableListOf<DocLevelQuery>()
+        // Wazuh: the query of the monitor that each new query comes from, by new query id, to name it if it is refused.
+        val monitorQueryIds = mutableMapOf<String, String>()
         queries.forEach {
             val filteredConcreteIndices = mutableSetOf<String>()
             var query = it.query
@@ -650,9 +658,12 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                         queryFieldNames = fieldNames
                     )
                     newQueries.add(newQuery)
+                    monitorQueryIds[newQuery.id] = it.id
                 }
             } else {
-                newQueries.add(it.copy(id = "${it.id}_$sourceIndex", queryFieldNames = fieldNames))
+                val newQuery = it.copy(id = "${it.id}_$sourceIndex", queryFieldNames = fieldNames)
+                newQueries.add(newQuery)
+                monitorQueryIds[newQuery.id] = it.id
             }
         }
 
@@ -686,11 +697,16 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     BulkRequest().setRefreshPolicy(refreshPolicy).timeout(indexTimeout).add(indexRequests), it
                 )
             }
+            // Wazuh: the queries refused for a field the query index has no mapping for, and that field, by query id.
+            val refused = mutableMapOf<String, String>()
             bulkResponse.forEach { bulkItemResponse ->
                 if (bulkItemResponse.isFailed) {
                     val failureMessage = bulkItemResponse.failureMessage
-                    if (failureMessage?.contains("No field mapping can be found") == true) {
-                        // Expected during WCS dynamic mapping bootstrap; resolves itself as data arrives.
+                    val unmappedField = failureMessage?.let { NO_FIELD_MAPPING.find(it)?.groupValues?.get(1) }
+                    if (unmappedField != null) {
+                        // A field of the query that was neither mapped nor pointed at the sentinel: reported below.
+                        val queryId = bulkItemResponse.id.removeSuffix("_$monitorId")
+                        refused[monitorQueryIds[queryId] ?: queryId] = unmappedField
                         log.debug(failureMessage)
                     } else if (isNodeUnavailableFailure(bulkItemResponse.failure.cause)) {
                         // The node is shutting down or a peer has gone away: the queries are indexed again on the next run.
@@ -700,6 +716,7 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     }
                 }
             }
+            refusedQueriesMessage(monitorId, sourceIndex, queries.size, refused)?.let { log.warn(it) }
             if (!bulkResponse.hasFailures()) {
                 // Wazuh: the concrete index behind the query index alias is read from the responses.
                 val queryIndexUuid = bulkResponse.items.mapTo(mutableSetOf()) { it.getResponse<DocWriteResponse>().shardId.index.uuid }.singleOrNull()
@@ -904,6 +921,23 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         return "Monitor $monitorId: ${undeclared.size} of its ${queries.size} queries name fields that [$sourceIndex] neither maps " +
             "nor declares in a dynamic template. Their clauses over those fields match no document until it does: " +
             undeclared.entries.joinToString("; ") { "${it.key} ${it.value}" }
+    }
+
+    /**
+     * Wazuh: the log line for the queries of [monitorId] over [sourceIndex] that the query index refused because they
+     * name a field it has no mapping for, given by query id in [refused], or null when they are the ones last reported
+     * for [sourceIndex] or there is none.
+     *
+     * Every field read from a query is mapped in the query index or pointed at [ABSENT_FIELD_SENTINEL], so a refused
+     * field is one that was missed. The query is not stored and matches no document. While one is refused, every run
+     * indexes the queries again, so the line is logged only when the refused queries change. Internal, not private,
+     * for DocLevelMonitorQueriesTests.
+     */
+    internal fun refusedQueriesMessage(monitorId: String, sourceIndex: String, queryCount: Int, refused: Map<String, String>): String? {
+        if (!indexedQueries.refusedQueriesChanged(monitorId, sourceIndex, refused) || refused.isEmpty()) return null
+        return "Monitor $monitorId: the query index refused ${refused.size} of its $queryCount queries over [$sourceIndex], which " +
+            "name a field it has no mapping for. They match no document: " +
+            refused.toSortedMap().entries.joinToString("; ") { "${it.key} [${it.value}]" }
     }
 
     private suspend fun updateQueryIndexMappings(

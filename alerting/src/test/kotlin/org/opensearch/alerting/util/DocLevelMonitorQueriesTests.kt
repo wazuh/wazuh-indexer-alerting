@@ -6,10 +6,14 @@
 package org.opensearch.alerting.util
 
 import kotlinx.coroutines.runBlocking
+import org.apache.logging.log4j.Level
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.core.LogEvent
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.mock
 import org.opensearch.Version
+import org.opensearch.action.DocWriteRequest
 import org.opensearch.action.bulk.BulkItemResponse
 import org.opensearch.action.bulk.BulkRequest
 import org.opensearch.action.bulk.BulkResponse
@@ -27,6 +31,10 @@ import org.opensearch.common.xcontent.XContentHelper
 import org.opensearch.common.xcontent.json.JsonXContent
 import org.opensearch.commons.alerting.model.DocLevelQuery
 import org.opensearch.core.action.ActionListener
+import org.opensearch.core.index.Index
+import org.opensearch.index.mapper.MapperParsingException
+import org.opensearch.index.query.QueryShardException
+import org.opensearch.test.MockLogAppender
 import org.opensearch.test.OpenSearchTestCase
 import org.opensearch.transport.client.Client
 
@@ -252,8 +260,9 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
         listOf(
             // The template applies to some values only.
             """{"path_match": "user.*", "match_mapping_type": "string", "mapping": {"type": "keyword"}}""",
-            // The mapping is filled from the document.
+            // The mapping is filled from the document, also with the older spelling of the type placeholder.
             """{"path_match": "user.*", "mapping": {"type": "{dynamic_type}"}}""",
+            """{"path_match": "user.*", "mapping": {"type": "{dynamicType}"}}""",
             """{"path_match": "user.*", "mapping": {"type": "text", "copy_to": "all_{name}"}}""",
             """{"path_match": "user.*", "mapping": {"ignore_above": 1024}}""",
             // The field is an object.
@@ -337,6 +346,73 @@ class DocLevelMonitorQueriesTests : OpenSearchTestCase() {
         assertNull(queries.undeclaredFieldsMessage("mid", "events*", "events_", listOf(declared, unnamed), mapped))
         queries.forgetIndexedQueries("mid")
         assertNotNull(queries.undeclaredFieldsMessage("mid", "events*", "events_", listOf(declared, unnamed), mapped))
+    }
+
+    fun `test queries the query index refuses for an unmapped field are logged once while they are the same`() {
+        // `registry.value` is missing from the field names, so it is neither renamed nor pointed at the sentinel.
+        val named = DocLevelQuery("named", "named", emptyList(), "registry.path:\"a\" AND registry.value:\"b\"", emptyList(), listOf("registry.path"))
+        val other = DocLevelQuery("other", "other", emptyList(), "registry.path:\"c\"", emptyList(), listOf("registry.path"))
+        val client = mock(Client::class.java)
+        // The field the query index refuses in the next bulk, by query document id.
+        var refusedFields = emptyMap<String, String>()
+        doAnswer { invocation ->
+            val requests = invocation.getArgument<BulkRequest>(0).requests()
+            val items = requests.mapIndexedNotNull { i, request ->
+                refusedFields[request.id()]?.let { field ->
+                    val reason = QueryShardException(Index("query-index", "_na_"), "No field mapping can be found for the field with name [{}]", null, field)
+                    val cause = MapperParsingException("failed to parse field [query] of type [percolator]", reason)
+                    BulkItemResponse(i, DocWriteRequest.OpType.INDEX, BulkItemResponse.Failure("query-index", request.id(), cause))
+                }
+            }
+            invocation.getArgument<ActionListener<BulkResponse>>(1).onResponse(BulkResponse(items.toTypedArray(), 0))
+            null
+        }.`when`(client).bulk(any(), any())
+        val queries = DocLevelMonitorQueries(client, mock(ClusterService::class.java))
+
+        /** Indexes both queries over source index `idx`, refusing [refused], and gives the WARN lines logged. */
+        fun warnings(refused: Map<String, String>): List<String> {
+            refusedFields = refused
+            val logged = mutableListOf<String>()
+            MockLogAppender.createForLoggers(LogManager.getLogger(DocLevelMonitorQueries::class.java)).use { appender ->
+                appender.addExpectation(object : MockLogAppender.LoggingExpectation {
+                    override fun match(event: LogEvent) {
+                        if (event.level == Level.WARN) logged.add(event.message.formattedMessage)
+                    }
+
+                    override fun assertMatched() {}
+                })
+                runBlocking {
+                    queries.doIndexAllQueries(
+                        "query-index", "idx", "mid", listOf(named, other), mutableSetOf(Pair("registry.path", "idx")), emptySet(),
+                        RefreshPolicy.NONE, TimeValue.timeValueSeconds(1)
+                    )
+                }
+            }
+            return logged
+        }
+
+        val refusedNamed = mapOf("named_idx_mid" to "registry.value")
+        assertEquals(
+            listOf(
+                "Monitor mid: the query index refused 1 of its 2 queries over [idx], which name a field it has no mapping for. " +
+                    "They match no document: named [registry.value]"
+            ),
+            warnings(refusedNamed)
+        )
+        // The next runs index the queries again, and the query index refuses the same one.
+        assertEquals(emptyList<String>(), warnings(refusedNamed))
+        // Once nothing is refused, a refusal is new again.
+        assertEquals(emptyList<String>(), warnings(emptyMap()))
+        assertEquals(1, warnings(refusedNamed).size)
+        // Another set of refused queries.
+        val both = warnings(refusedNamed + ("other_idx_mid" to "registry.path"))
+        assertEquals(both.toString(), 1, both.size)
+        val bothRefused = "refused 2 of its 2 queries over [idx], which name a field it has no mapping for. " +
+            "They match no document: named [registry.value]; other [registry.path]"
+        assertTrue(both.single(), both.single().endsWith(bothRefused))
+        // An updated or deleted monitor is forgotten.
+        queries.forgetIndexedQueries("mid")
+        assertEquals(1, warnings(refusedNamed).size)
     }
 
     /** The parsed form of a mapping, as an index gives it. */

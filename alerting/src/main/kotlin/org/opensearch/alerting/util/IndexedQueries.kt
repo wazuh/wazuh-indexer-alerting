@@ -77,6 +77,9 @@ internal class IndexedQueriesRegistry {
     /** The queries last reported as naming undeclared fields, and those fields, by monitor id and source index. */
     private val undeclaredFields = ConcurrentHashMap<Pair<String, String>, Map<String, List<String>>>()
 
+    /** The queries last reported as refused by the query index, and the field it refused, by monitor id and source index. */
+    private val refusedQueries = ConcurrentHashMap<Pair<String, String>, Map<String, String>>()
+
     fun get(monitorId: String, sourceIndex: String): IndexedQueries? = indexed[monitorId to sourceIndex]
 
     fun put(monitorId: String, sourceIndex: String, queries: IndexedQueries) {
@@ -91,15 +94,27 @@ internal class IndexedQueriesRegistry {
      * Remembers the queries of a source index that name undeclared fields. True when they are not the ones
      * remembered before, which is when they are worth a log line.
      */
-    fun undeclaredFieldsChanged(monitorId: String, sourceIndex: String, fields: Map<String, List<String>>): Boolean {
-        val key = monitorId to sourceIndex
-        val previous = if (fields.isEmpty()) undeclaredFields.remove(key) else undeclaredFields.put(key, fields)
-        return fields != previous.orEmpty()
+    fun undeclaredFieldsChanged(monitorId: String, sourceIndex: String, fields: Map<String, List<String>>): Boolean =
+        remember(undeclaredFields, monitorId to sourceIndex, fields)
+
+    /** Remembers the queries of a source index that the query index refused, as [undeclaredFieldsChanged] does. */
+    fun refusedQueriesChanged(monitorId: String, sourceIndex: String, refused: Map<String, String>): Boolean =
+        remember(refusedQueries, monitorId to sourceIndex, refused)
+
+    /** Puts [value] in [reported] under [key], or removes the key when [value] is empty. True when the value changed. */
+    private fun <V> remember(
+        reported: ConcurrentHashMap<Pair<String, String>, Map<String, V>>,
+        key: Pair<String, String>,
+        value: Map<String, V>
+    ): Boolean {
+        val previous = if (value.isEmpty()) reported.remove(key) else reported.put(key, value)
+        return value != previous.orEmpty()
     }
 
     /** Forgets every source index of [monitorId]. */
     fun forget(monitorId: String) {
         indexed.keys.removeIf { it.first == monitorId }
         undeclaredFields.keys.removeIf { it.first == monitorId }
+        refusedQueries.keys.removeIf { it.first == monitorId }
     }
 }
