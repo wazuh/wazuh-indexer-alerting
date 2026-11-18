@@ -193,7 +193,8 @@ open class DocumentLevelMonitorRunner : MonitorRunner() {
                 updatedIndexNames.add(updatedIndexName)
                 val conflictingFields = monitorCtx.docLevelMonitorQueries!!.getAllConflictingFields(
                     monitorCtx.clusterService!!.state(),
-                    concreteIndices
+                    concreteIndices,
+                    queries
                 )
 
                 concreteIndices.forEach { concreteIndexName ->

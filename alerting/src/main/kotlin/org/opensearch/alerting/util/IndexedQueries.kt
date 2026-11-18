@@ -14,9 +14,9 @@ import java.util.concurrent.ConcurrentHashMap
  * What the percolate queries of one source index of a doc-level monitor were built from.
  *
  * The queries depend on the monitor's queries, on the mappings of the concrete source indices (fields
- * are renamed, or pointed at [DocLevelMonitorQueries.ABSENT_FIELD_SENTINEL] when unmapped) and on the
- * query index they are stored in. While none of these change, indexing them again gives the same
- * documents.
+ * are renamed, or pointed at [DocLevelMonitorQueries.ABSENT_FIELD_SENTINEL] when neither mapped nor
+ * declared in a dynamic template) and on the query index they are stored in. While none of these
+ * change, indexing them again gives the same documents.
  */
 internal data class IndexedQueriesState(
     /** The indices and queries of the monitor, see [queryInputs]. */
@@ -74,6 +74,9 @@ internal data class IndexedQueries(val state: IndexedQueriesState, val docIds: S
 internal class IndexedQueriesRegistry {
     private val indexed = ConcurrentHashMap<Pair<String, String>, IndexedQueries>()
 
+    /** The queries last reported as naming undeclared fields, and those fields, by monitor id and source index. */
+    private val undeclaredFields = ConcurrentHashMap<Pair<String, String>, Map<String, List<String>>>()
+
     fun get(monitorId: String, sourceIndex: String): IndexedQueries? = indexed[monitorId to sourceIndex]
 
     fun put(monitorId: String, sourceIndex: String, queries: IndexedQueries) {
@@ -84,8 +87,19 @@ internal class IndexedQueriesRegistry {
         indexed.remove(monitorId to sourceIndex)
     }
 
+    /**
+     * Remembers the queries of a source index that name undeclared fields. True when they are not the ones
+     * remembered before, which is when they are worth a log line.
+     */
+    fun undeclaredFieldsChanged(monitorId: String, sourceIndex: String, fields: Map<String, List<String>>): Boolean {
+        val key = monitorId to sourceIndex
+        val previous = if (fields.isEmpty()) undeclaredFields.remove(key) else undeclaredFields.put(key, fields)
+        return fields != previous.orEmpty()
+    }
+
     /** Forgets every source index of [monitorId]. */
     fun forget(monitorId: String) {
         indexed.keys.removeIf { it.first == monitorId }
+        undeclaredFields.keys.removeIf { it.first == monitorId }
     }
 }
