@@ -57,6 +57,7 @@ import org.opensearch.index.reindex.DeleteByQueryRequestBuilder
 import org.opensearch.indices.IndicesModule
 import org.opensearch.search.builder.SearchSourceBuilder
 import org.opensearch.transport.client.Client
+import java.util.regex.PatternSyntaxException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
@@ -69,14 +70,17 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         const val PROPERTIES = "properties"
         const val NESTED = "nested"
         const val TYPE = "type"
+        const val OBJECT = "object"
+        const val DYNAMIC = "dynamic"
+        const val DYNAMIC_TEMPLATES = "dynamic_templates"
         const val INDEX_PATTERN_SUFFIX = "-000001"
         const val QUERY_INDEX_BASE_FIELDS_COUNT = 9 // 4 fields we defined and 5 builtin additional metadata fields
 
         /**
          * Field mapped in the query index but never present in a percolated document.
          *
-         * Clauses over a field that the source index does not map are pointed at it so that the
-         * percolator can parse them (see [transformAbsentFieldQuery]).
+         * Clauses over a field that the source index neither maps nor declares in a dynamic template are
+         * pointed at it so that the percolator can parse them (see [transformAbsentFieldQuery]).
          */
         const val ABSENT_FIELD_SENTINEL = "wazuh_absent_field_sentinel"
 
@@ -94,6 +98,18 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
 
         /** The field of an `_exists_:field` clause. */
         private val EXISTS_FIELD = Regex("_exists_:([\\w@][\\w.@-]*)")
+
+        /** The values of `dynamic` under which an index applies its dynamic templates to a new field. */
+        private val DYNAMIC_WITH_TEMPLATES = setOf("true", "strict_allow_templates", "false_allow_templates")
+
+        /**
+         * The placeholders a dynamic template fills from the document, so its mapping is not known before one arrives.
+         * `{dynamicType}` is the older spelling of `{dynamic_type}`, which OpenSearch still fills.
+         */
+        private val TEMPLATE_PLACEHOLDERS = listOf("{name}", "{dynamic_type}", "{dynamicType}")
+
+        /** The field of a query that the query index refused because it has no mapping for it. */
+        private val NO_FIELD_MAPPING = Regex("No field mapping can be found for the field with name \\[([^\\]]*)]")
 
         @JvmStatic
         fun docLevelQueriesMappings(): String {
@@ -313,6 +329,8 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         val queryIndexResolver = QueryIndexWriteIndexResolver()
         // Wazuh: the query documents of this monitor, once every source index has been handled, to delete the others.
         val currentQueries = CurrentQueryDocs()
+        // Wazuh: the fields the queries name, to take the ones a source index only declares as mapped.
+        val fieldNames = queryFieldNamesOf(queries)
 
         // Run through each backing index and apply appropriate mappings to query index
         indices.forEach { indexName ->
@@ -349,16 +367,13 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             val updatedProperties = mutableMapOf<String, Any>()
             val allFlattenPaths = mutableSetOf<Pair<String, String>>()
             var sourceIndexFieldLimit = 0L
-            val conflictingFields = getAllConflictingFields(clusterState, concreteIndices)
+            val conflictingFields = getAllConflictingFields(clusterState, concreteIndices, queries)
 
             concreteIndices.forEach { concreteIndexName ->
                 if (clusterState.routingTable.hasIndex(concreteIndexName)) {
                     val indexMetadata = clusterState.metadata.index(concreteIndexName)
-                    if (indexMetadata.mapping()?.sourceAsMap?.get("properties") != null) {
-                        val properties = (
-                            (indexMetadata.mapping()?.sourceAsMap?.get("properties"))
-                                as MutableMap<String, Any>
-                            )
+                    val properties = sourceProperties(indexMetadata.mapping()?.sourceAsMap, fieldNames)
+                    if (properties != null) {
                         // Node processor function is used to process leaves of index mappings tree
                         //
                         val leafNodeProcessor =
@@ -416,6 +431,11 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
             // Keep the sentinel mapped on pre-existing query indices too: the base mappings only
             // apply to a query index created from scratch.
             updatedProperties[ABSENT_FIELD_SENTINEL] = mapOf(TYPE to "keyword")
+            // Wazuh: a scheduled run tells which queries are left on the sentinel, once while they are the same.
+            if (reuseIndexedQueries) {
+                val mappedPaths = allFlattenPaths.mapTo(mutableSetOf()) { it.first }
+                undeclaredFieldsMessage(monitorId, indexName, updatedIndexName, queries, mappedPaths)?.let { log.info(it) }
+            }
 
             // Updates mappings of concrete queryIndex. This can rollover queryIndex if field mapping limit is reached.
             val (updateMappingResponse, concreteQueryIndex) = updateQueryIndexMappings(
@@ -613,13 +633,15 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         }
 
         val newQueries = mutableListOf<DocLevelQuery>()
+        // Wazuh: the query of the monitor that each new query comes from, by new query id, to name it if it is refused.
+        val monitorQueryIds = mutableMapOf<String, String>()
         queries.forEach {
             val filteredConcreteIndices = mutableSetOf<String>()
             var query = it.query
             // Wazuh: the fields the absent-field rewrite below checks. A query without field names, such
             // as a Security Analytics rule that also matches a keyword in any field, still names fields
             // in its text (wazuh/wazuh-indexer-plugins#1747). Read from the query before any rename.
-            val fieldNames = it.queryFieldNames.ifEmpty { fieldNamesIn(it.query).toList() }
+            val fieldNames = fieldNamesOf(it)
             conflictingPaths.forEach { conflictingPath ->
                 if (query.contains(conflictingPath)) {
                     query = transformExistsQuery(query, conflictingPath, "<index>", monitorId)
@@ -636,9 +658,12 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                         queryFieldNames = fieldNames
                     )
                     newQueries.add(newQuery)
+                    monitorQueryIds[newQuery.id] = it.id
                 }
             } else {
-                newQueries.add(it.copy(id = "${it.id}_$sourceIndex", queryFieldNames = fieldNames))
+                val newQuery = it.copy(id = "${it.id}_$sourceIndex", queryFieldNames = fieldNames)
+                newQueries.add(newQuery)
+                monitorQueryIds[newQuery.id] = it.id
             }
         }
 
@@ -652,10 +677,7 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     query = query.replace("${fieldPath.first}:", "${fieldPath.first}_${sourceIndex}_$monitorId:")
                 }
             }
-            query = transformAbsentFieldQuery(
-                query,
-                it.queryFieldNames.filterNot { f -> mappedPaths.contains(f) || METADATA_FIELDS.contains(f) }
-            )
+            query = transformAbsentFieldQuery(query, undeclaredFieldsOf(it.queryFieldNames, mappedPaths))
             val indexRequest = IndexRequest(concreteQueryIndex)
                 .id(it.id + "_$monitorId")
                 .source(
@@ -675,11 +697,16 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     BulkRequest().setRefreshPolicy(refreshPolicy).timeout(indexTimeout).add(indexRequests), it
                 )
             }
+            // Wazuh: the queries refused for a field the query index has no mapping for, and that field, by query id.
+            val refused = mutableMapOf<String, String>()
             bulkResponse.forEach { bulkItemResponse ->
                 if (bulkItemResponse.isFailed) {
                     val failureMessage = bulkItemResponse.failureMessage
-                    if (failureMessage?.contains("No field mapping can be found") == true) {
-                        // Expected during WCS dynamic mapping bootstrap; resolves itself as data arrives.
+                    val unmappedField = failureMessage?.let { NO_FIELD_MAPPING.find(it)?.groupValues?.get(1) }
+                    if (unmappedField != null) {
+                        // A field of the query that was neither mapped nor pointed at the sentinel: reported below.
+                        val queryId = bulkItemResponse.id.removeSuffix("_$monitorId")
+                        refused[monitorQueryIds[queryId] ?: queryId] = unmappedField
                         log.debug(failureMessage)
                     } else if (isNodeUnavailableFailure(bulkItemResponse.failure.cause)) {
                         // The node is shutting down or a peer has gone away: the queries are indexed again on the next run.
@@ -689,6 +716,7 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     }
                 }
             }
+            refusedQueriesMessage(monitorId, sourceIndex, queries.size, refused)?.let { log.warn(it) }
             if (!bulkResponse.hasFailures()) {
                 // Wazuh: the concrete index behind the query index alias is read from the responses.
                 val queryIndexUuid = bulkResponse.items.mapTo(mutableSetOf()) { it.getResponse<DocWriteResponse>().shardId.index.uuid }.singleOrNull()
@@ -721,7 +749,7 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
     }
 
     /**
-     * Points clauses over fields that the source index does not map at [ABSENT_FIELD_SENTINEL].
+     * Points clauses over fields that the source index neither maps nor declares at [ABSENT_FIELD_SENTINEL].
      *
      * The percolator refuses to parse a query that references an unmapped field ("No field mapping
      * can be found for the field with name [...]"), so a single such clause silently drops the whole
@@ -729,26 +757,28 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
      * detect a *missing* field: the field never reaches a document, so the source index never maps
      * it, so the rule can never be indexed (wazuh/wazuh-indexer-plugins#1518).
      *
-     * A field absent from the mapping is absent from every document of the index -- event indices are
-     * `strict_allow_templates`, so a field only gets mapped when a document brings it. Pointing the
-     * clause at a field that is mapped in the query index but never present in a percolated document
-     * preserves that meaning: `<absent field>: <anything>` and `_exists_:<absent field>` are false,
-     * `NOT _exists_:<absent field>` is true. Once documents do bring the field, the source index maps
-     * it and the [flattenPaths] rename above takes over -- queries are rebuilt on every monitor run.
+     * A field the index has no mapping for, neither in its `properties` nor in a dynamic template (see
+     * [sourceProperties]), is absent from every document it can map. Pointing the clause at a field that
+     * is mapped in the query index but never present in a percolated document preserves that meaning:
+     * `<absent field>: <anything>` and `_exists_:<absent field>` are false, `NOT _exists_:<absent field>`
+     * is true. If the source index maps the field later, its mapping version changes and the queries are
+     * indexed again, renamed like any mapped field.
      */
     internal fun transformAbsentFieldQuery(query: String, absentFields: Collection<String>): String {
         if (absentFields.isEmpty()) return query
         // Read `_exists_: field` as a single token, the same way transformExistsQuery does.
         var transformed = query.replace("_exists_: ", "_exists_:")
         absentFields.forEach { field ->
-            val name = Regex.escape(field)
-            // Only whole field names in a field position, so that neither the `name` of `user.name`
-            // nor a `user.name` inside a matched value is rewritten.
-            transformed = transformed.replace(Regex("(?<![\\w.])$name(?=:)"), ABSENT_FIELD_SENTINEL)
-            transformed = transformed.replace(Regex("(?<=_exists_:)$name(?![\\w.])"), ABSENT_FIELD_SENTINEL)
+            transformed = transformed.replace(valueClauseOf(field), ABSENT_FIELD_SENTINEL)
+            transformed = transformed.replace(existsClauseOf(field), ABSENT_FIELD_SENTINEL)
         }
         return transformed
     }
+
+    // Only whole field names in a field position, so that neither the `name` of `user.name` nor a
+    // `user.name` inside a matched value is rewritten.
+    private fun valueClauseOf(field: String) = Regex("(?<![\\w.])${Regex.escape(field)}(?=:)")
+    private fun existsClauseOf(field: String) = Regex("(?<=_exists_:)${Regex.escape(field)}(?![\\w.])")
 
     /**
      * Gives the field names a `query_string` query refers to: the names before a `:` and the names after
@@ -764,6 +794,150 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
         EXISTS_FIELD.findAll(masked).forEach { names.add(it.groupValues[1]) }
         names.remove("_exists_")
         return names
+    }
+
+    /** Wazuh: the fields [query] refers to: its field names, or the names in its text when it carries none. */
+    private fun fieldNamesOf(query: DocLevelQuery): List<String> = query.queryFieldNames.ifEmpty { fieldNamesIn(query.query).toList() }
+
+    /** Wazuh: the fields [queries] refer to, without the metadata fields, which no index maps. */
+    fun queryFieldNamesOf(queries: List<DocLevelQuery>): Set<String> =
+        queries.flatMapTo(mutableSetOf()) { fieldNamesOf(it) }.apply { removeAll(METADATA_FIELDS) }
+
+    /** Wazuh: the ones of [fieldNames] that [transformAbsentFieldQuery] points at the sentinel, given the mapped paths. */
+    private fun undeclaredFieldsOf(fieldNames: Collection<String>, mappedPaths: Set<String>): List<String> =
+        fieldNames.filterNot { mappedPaths.contains(it) || METADATA_FIELDS.contains(it) }
+
+    /**
+     * Wazuh: the `properties` of a source index [mapping], plus the leaf its dynamic templates declare for
+     * each of [fieldNames] that it does not map yet. Null when the index has no field at all.
+     *
+     * Event indices are `strict_allow_templates`: a dynamic template declares each field, and the index
+     * maps it when the first document carries it. A query over a field not mapped yet was pointed at
+     * [ABSENT_FIELD_SENTINEL] and could not match: on a new index, and again after every rollover, until a
+     * later run indexed the queries again (wazuh/wazuh-indexer-alerting#195). The template already gives
+     * the mapping the field will have, so the field counts as mapped from the start, and the first
+     * document that carries it is evaluated against the real query.
+     */
+    @Suppress("UNCHECKED_CAST")
+    internal fun sourceProperties(mapping: Map<String, Any>?, fieldNames: Collection<String>): MutableMap<String, Any>? {
+        val properties = mapping?.get(PROPERTIES) as? MutableMap<String, Any>
+        val templates = mapping?.get(DYNAMIC_TEMPLATES) as? List<*>
+        if (templates.isNullOrEmpty() || fieldNames.isEmpty()) return properties
+        val declared = properties ?: mutableMapOf()
+        fieldNames.forEach { declareField(declared, it, mapping?.get(DYNAMIC), templates) }
+        return declared.takeIf { properties != null || it.isNotEmpty() }
+    }
+
+    /**
+     * Wazuh: adds to [properties] the leaf that [templates] declare for [field], unless the index maps the
+     * field already or could not map it: under a field that is not an object, under a nested or disabled
+     * object, or where `dynamic` does not let templates apply.
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun declareField(properties: MutableMap<String, Any>, field: String, rootDynamic: Any?, templates: List<*>) {
+        val path = field.split(".")
+        if (path.any { it.isEmpty() }) return
+        var dynamic = rootDynamic
+        var children: Map<String, Any>? = properties
+        for (name in path.dropLast(1)) {
+            val parent = children?.get(name) as? Map<String, Any>
+            if (parent != null) {
+                val type = parent[TYPE]
+                if ((type != null && type != OBJECT) || parent["enabled"] == false) return
+                dynamic = parent[DYNAMIC] ?: dynamic
+            }
+            children = parent?.get(PROPERTIES) as? Map<String, Any>
+        }
+        if (children?.containsKey(path.last()) == true) return
+        if (dynamic != null && dynamic.toString() !in DYNAMIC_WITH_TEMPLATES) return
+        val leaf = declaredLeaf(field, templates) ?: return
+
+        var target = properties
+        for (name in path.dropLast(1)) {
+            val parent = target.getOrPut(name) { mutableMapOf<String, Any>() } as MutableMap<String, Any>
+            // An object without fields is rendered as {"type": "object"}, which the traversal reads as a leaf.
+            parent.remove(TYPE)
+            target = parent.getOrPut(PROPERTIES) { mutableMapOf<String, Any>() } as MutableMap<String, Any>
+        }
+        target[path.last()] = leaf
+    }
+
+    /**
+     * Wazuh: the mapping that the first of [dynamicTemplates] to match [field] gives it, or null when none
+     * matches or when its mapping cannot be told before a document arrives.
+     *
+     * The templates are tried in order and the first match decides, as when a document is indexed. One
+     * that depends on the value (`match_mapping_type`), fills its mapping from the document or maps an
+     * object ends the search with no mapping. A later template is not tried: a query stored against a
+     * type the source index then contradicts would break the mapping of the query index.
+     */
+    @Suppress("UNCHECKED_CAST")
+    internal fun declaredLeaf(field: String, dynamicTemplates: List<*>): MutableMap<String, Any>? {
+        val name = field.substringAfterLast('.')
+        for (entry in dynamicTemplates) {
+            val template = (entry as? Map<*, *>)?.values?.firstOrNull() as? Map<String, Any> ?: continue
+            val regex = template["match_pattern"] == "regex"
+            fun matches(key: String, value: String): Boolean? = (template[key] as? String)?.let {
+                if (regex) Regex(it).matches(value) else org.opensearch.common.regex.Regex.simpleMatch(it, value)
+            }
+            try {
+                if (matches("path_match", field) == false || matches("match", name) == false) continue
+                if (matches("path_unmatch", field) == true || matches("unmatch", name) == true) continue
+            } catch (e: PatternSyntaxException) {
+                // An index created before such patterns were refused: whether it applies cannot be told.
+                return null
+            }
+
+            val mapping = template["mapping"] as? Map<String, Any> ?: return null
+            val type = mapping[TYPE] as? String ?: return null
+            val fromDocument = template.containsKey("match_mapping_type") || TEMPLATE_PLACEHOLDERS.any { mapping.toString().contains(it) }
+            return if (fromDocument || type == OBJECT || type == NESTED) null else mapping.toMutableMap()
+        }
+        return null
+    }
+
+    /**
+     * Wazuh: the log line for the queries of [monitorId] that name a field [sourceIndex] neither maps nor
+     * declares, or null when they are the ones last reported for [sourceIndexKey] or there is none.
+     *
+     * Such a clause is stored against [ABSENT_FIELD_SENTINEL] and matches no document, which looks the same
+     * as a query with nothing to match. Internal, not private, for DocLevelMonitorQueriesTests.
+     */
+    internal fun undeclaredFieldsMessage(
+        monitorId: String,
+        sourceIndex: String,
+        sourceIndexKey: String,
+        queries: List<DocLevelQuery>,
+        mappedPaths: Set<String>
+    ): String? {
+        val undeclared = queries.associate { query ->
+            // The field names of a query can be the ones of the whole monitor: only those it has a clause over count.
+            val text = query.query.replace("_exists_: ", "_exists_:")
+            query.id to undeclaredFieldsOf(fieldNamesOf(query), mappedPaths)
+                .filter { valueClauseOf(it).containsMatchIn(text) || existsClauseOf(it).containsMatchIn(text) }
+                .sorted()
+        }.filterValues { it.isNotEmpty() }
+        if (!indexedQueries.undeclaredFieldsChanged(monitorId, sourceIndexKey, undeclared) || undeclared.isEmpty()) return null
+        return "Monitor $monitorId: ${undeclared.size} of its ${queries.size} queries name fields that [$sourceIndex] neither maps " +
+            "nor declares in a dynamic template. Their clauses over those fields match no document until it does: " +
+            undeclared.entries.joinToString("; ") { "${it.key} ${it.value}" }
+    }
+
+    /**
+     * Wazuh: the log line for the queries of [monitorId] over [sourceIndex] that the query index refused because they
+     * name a field it has no mapping for, given by query id in [refused], or null when they are the ones last reported
+     * for [sourceIndex] or there is none.
+     *
+     * Every field read from a query is mapped in the query index or pointed at [ABSENT_FIELD_SENTINEL], so a refused
+     * field is one that was missed. The query is not stored and matches no document. While one is refused, every run
+     * indexes the queries again, so the line is logged only when the refused queries change. Internal, not private,
+     * for DocLevelMonitorQueriesTests.
+     */
+    internal fun refusedQueriesMessage(monitorId: String, sourceIndex: String, queryCount: Int, refused: Map<String, String>): String? {
+        if (!indexedQueries.refusedQueriesChanged(monitorId, sourceIndex, refused) || refused.isEmpty()) return null
+        return "Monitor $monitorId: the query index refused ${refused.size} of its $queryCount queries over [$sourceIndex], which " +
+            "name a field it has no mapping for. They match no document: " +
+            refused.toSortedMap().entries.joinToString("; ") { "${it.key} [${it.value}]" }
     }
 
     private suspend fun updateQueryIndexMappings(
@@ -939,19 +1113,32 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
     }
 
     /**
-     * get all fields which have same name but different mappings belonging to an index pattern
+     * Wazuh: whether two leaf mappings are the same, taking 1000 and 1000.0 as one number: a dynamic template
+     * holds a parameter as it was written and a mapping as the field stores it (`scaling_factor`).
      */
-    fun getAllConflictingFields(clusterState: ClusterState, concreteIndices: List<String>): Set<String> {
+    private fun sameMapping(a: Any?, b: Any?): Boolean = when {
+        a is Number && b is Number -> a.toDouble() == b.toDouble()
+        a is Map<*, *> && b is Map<*, *> -> a.size == b.size && a.all { (key, value) -> b.containsKey(key) && sameMapping(value, b[key]) }
+        else -> a == b
+    }
+
+    /**
+     * get all fields which have same name but different mappings belonging to an index pattern
+     *
+     * Wazuh: the fields that [queries] name and an index only declares count as mapped, as in
+     * [indexDocLevelQueries]: the queries and the documents are renamed from this set, so both have to read
+     * the same mappings. A single index has nothing to conflict with, so its mapping is not read.
+     */
+    fun getAllConflictingFields(clusterState: ClusterState, concreteIndices: List<String>, queries: List<DocLevelQuery>): Set<String> {
+        if (concreteIndices.size < 2) return emptySet()
+        val fieldNames = queryFieldNamesOf(queries)
         val conflictingFields = mutableSetOf<String>()
         val allFlattenPaths = mutableMapOf<String, MutableMap<String, Any>>()
         concreteIndices.forEach { concreteIndexName ->
             if (clusterState.routingTable.hasIndex(concreteIndexName)) {
                 val indexMetadata = clusterState.metadata.index(concreteIndexName)
-                if (indexMetadata.mapping()?.sourceAsMap?.get("properties") != null) {
-                    val properties = (
-                        (indexMetadata.mapping()?.sourceAsMap?.get("properties"))
-                            as MutableMap<String, Any>
-                        )
+                val properties = sourceProperties(indexMetadata.mapping()?.sourceAsMap, fieldNames)
+                if (properties != null) {
                     // Node processor function is used to process leaves of index mappings tree
                     //
                     val leafNodeProcessor =
@@ -963,7 +1150,7 @@ class DocLevelMonitorQueries(private val client: Client, private val clusterServ
                     traverseMappingsAndUpdate(properties, "", leafNodeProcessor, flattenPaths)
 
                     flattenPaths.forEach {
-                        if (allFlattenPaths.containsKey(it.key) && allFlattenPaths[it.key]!! != it.value) {
+                        if (allFlattenPaths.containsKey(it.key) && !sameMapping(allFlattenPaths[it.key], it.value)) {
                             conflictingFields.add(it.key)
                         }
                         allFlattenPaths.putIfAbsent(it.key, it.value)
