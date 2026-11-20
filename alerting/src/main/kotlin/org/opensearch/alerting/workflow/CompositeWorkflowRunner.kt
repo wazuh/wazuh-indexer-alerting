@@ -6,7 +6,6 @@
 package org.opensearch.alerting.workflow
 
 import org.apache.logging.log4j.LogManager
-import org.opensearch.ExceptionsHelper
 import org.opensearch.action.search.SearchRequest
 import org.opensearch.action.search.SearchResponse
 import org.opensearch.alerting.BucketLevelMonitorRunner
@@ -43,8 +42,6 @@ import org.opensearch.index.query.QueryBuilders
 import org.opensearch.index.query.QueryBuilders.boolQuery
 import org.opensearch.index.query.QueryBuilders.existsQuery
 import org.opensearch.index.query.QueryBuilders.termsQuery
-import org.opensearch.node.NodeClosedException
-import org.opensearch.transport.NodeNotConnectedException
 import org.opensearch.transport.TransportService
 import java.time.Instant
 import java.time.LocalDateTime
@@ -420,16 +417,4 @@ object CompositeWorkflowRunner : WorkflowRunner() {
             Alert.State.AUDIT
         } else Alert.State.ACTIVE
     }
-}
-
-/**
- * Returns true when [e], or the cause it wraps, means the local node is shutting down or a peer has
- * gone away, rather than a genuine failure of the operation being attempted.
- *
- * Such a failure is a normal outcome of a restart: the run is abandoned and retried on the next
- * schedule, so it does not warrant error-level logging.
- */
-fun isNodeUnavailableFailure(e: Exception): Boolean {
-    val cause = ExceptionsHelper.unwrapCause(e)
-    return cause is NodeClosedException || cause is NodeNotConnectedException
 }
