@@ -1902,6 +1902,106 @@ class DocumentMonitorRunnerIT : AlertingRestTestCase() {
         deleteDataStream(dataStreamName)
     }
 
+    fun `test document-level monitor matches the first document of a field the datastream only declares`() {
+        val dataStreamName = "test-datastream"
+        // No field is mapped before a document carries it: a dynamic template declares each one.
+        createDataStream(
+            dataStreamName,
+            """
+                "dynamic": "strict_allow_templates",
+                "dynamic_templates": [
+                  { "user_name": { "path_match": "user.name", "mapping": { "type": "keyword" } } },
+                  { "source_ip": { "path_match": "source.ip", "mapping": { "type": "ip" } } },
+                  { "source_bytes": { "path_match": "source.bytes", "mapping": { "type": "long" } } }
+                ],
+                "properties": {
+                  "@timestamp": { "type": "date" },
+                  "user": { "type": "object" },
+                  "source": { "type": "object" }
+                }
+            """.trimIndent(),
+            false
+        )
+
+        val term = DocLevelQuery(query = "user.name:\"alice\"", name = "term", fields = listOf())
+        val cidr = DocLevelQuery(query = "source.ip:\"10.20.0.0/16\"", name = "cidr", fields = listOf(), queryFieldNames = listOf("source.ip"))
+        val range = DocLevelQuery(query = "source.bytes:>1000", name = "range", fields = listOf())
+        // No template declares `user.roles`, so the stream can never map it.
+        val undeclared = DocLevelQuery(query = "user.roles:\"admin\"", name = "undeclared", fields = listOf())
+        val missing = DocLevelQuery(query = "user.name:\"alice\" AND NOT _exists_:user.roles", name = "missing", fields = listOf())
+        val queries = listOf(term, cidr, range, undeclared, missing)
+        val monitor = createMonitor(
+            randomDocumentLevelMonitor(
+                inputs = listOf(DocLevelMonitorInput("description", listOf(dataStreamName), queries)),
+                triggers = listOf(randomDocumentLevelTrigger(condition = ALWAYS_RUN))
+            )
+        )
+
+        /** The query stored for each query of the monitor, by query name. */
+        fun storedQueries(): Map<String, String> {
+            val search = """{"size": 100, "query": {"match": {"monitor_id": {"query": "${monitor.id}", "operator": "and"}}}}"""
+            val response = client().makeRequest(
+                "GET", "/${monitor.dataSources.queryIndex}/_search", emptyMap(), StringEntity(search, ContentType.APPLICATION_JSON)
+            )
+            @Suppress("UNCHECKED_CAST")
+            val hits = (response.asMap()["hits"] as Map<String, Any>)["hits"] as List<Map<String, Any>>
+            return queries.associate { query ->
+                val hit = hits.single { (it["_id"] as String).startsWith(query.id) }
+                @Suppress("UNCHECKED_CAST")
+                val stored = ((hit["_source"] as Map<String, Any>)["query"] as Map<String, Map<String, Any>>)["query_string"]!!
+                query.name to stored["query"] as String
+            }
+        }
+
+        /** The stored queries name the fields of the stream, and the sentinel only where the stream declares none. */
+        fun assertDeclaredFieldsAreQueried(moment: String) {
+            val suffix = "_${dataStreamName}_${monitor.id}"
+            val sentinel = "wazuh_absent_field_sentinel"
+            assertEquals(
+                moment,
+                mapOf(
+                    "term" to "user.name$suffix:\"alice\"",
+                    "cidr" to "source.ip$suffix:\"10.20.0.0/16\"",
+                    "range" to "source.bytes$suffix:>1000",
+                    "undeclared" to "$sentinel:\"admin\"",
+                    "missing" to "user.name$suffix:\"alice\" AND NOT _exists_:$sentinel"
+                ),
+                storedQueries()
+            )
+        }
+
+        /** Runs the monitor and gives how many documents each query matched, by query name. */
+        fun matches(): Map<String, Int> {
+            val output = entityAsMap(executeMonitor(monitor.id))
+            @Suppress("UNCHECKED_CAST")
+            val results = (output.objectMap("input_results")["results"] as List<Map<String, Any>>).first()
+            return queries.associate { it.name to (results[it.id] as? List<*>).orEmpty().size }
+        }
+
+        val testTime = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now().truncatedTo(MILLIS))
+        val testDoc = """{
+            "@timestamp": "$testTime",
+            "user": { "name": "alice" },
+            "source": { "ip": "10.20.3.4", "bytes": 2048 }
+        }"""
+        val matched = mapOf("term" to 1, "cidr" to 1, "range" to 1, "undeclared" to 0, "missing" to 1)
+
+        assertDeclaredFieldsAreQueried("before any document")
+        indexDoc(dataStreamName, "1", testDoc)
+        assertEquals("First document of the stream", matched, matches())
+
+        // The first run after the rollover moves on to the new write index. From the second one the monitor
+        // only reads that index, which has mapped none of the fields yet.
+        rolloverDatastream(dataStreamName)
+        assertEquals("No new document", matched.mapValues { 0 }, matches())
+        assertEquals("No new document", matched.mapValues { 0 }, matches())
+        assertDeclaredFieldsAreQueried("after a rollover, before any document")
+        indexDoc(dataStreamName, "2", testDoc)
+        assertEquals("First document after the rollover", matched, matches())
+
+        deleteDataStream(dataStreamName)
+    }
+
     fun `test document-level monitor when datastreams contain docs across read-only indices that do match query`() {
         val dataStreamName = "test-datastream"
         createDataStream(
