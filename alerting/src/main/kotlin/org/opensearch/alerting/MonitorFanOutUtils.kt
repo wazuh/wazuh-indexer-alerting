@@ -18,7 +18,11 @@ import org.opensearch.index.query.QueryBuilders
 import org.opensearch.index.search.QueryParserHelper
 import org.opensearch.index.seqno.SequenceNumbers
 import org.opensearch.search.SearchHits
+import java.time.Duration
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.math.max
+import kotlin.math.min
 
 private val logger: Logger = LogManager.getLogger("FanOutEligibility")
 
@@ -172,6 +176,87 @@ suspend fun <T> percolateIsolatingFailures(
 
     narrowDown(docs)
     return PercolateIsolation(failing, unresolved)
+}
+
+/**
+ * The smallest batch [DocLevelBatchLimits] halves a monitor down to. A percolate search has a fixed cost, tens of
+ * megabytes for a monitor with many queries, whatever the number of documents, so a smaller batch would not make
+ * it much lighter.
+ */
+const val MIN_HALVED_BATCH_SIZE = 1000
+
+/** How long a halved monitor must run without a refused search before [DocLevelBatchLimits] doubles its batches. */
+val HALVED_BATCH_RECOVERY: Duration = Duration.ofMinutes(15)
+
+/**
+ * Batch limits, on this node, of the doc-level monitors whose shard reads or percolate searches the node refused for
+ * want of memory.
+ *
+ * A refused batch is deferred, and the next run reads the same documents again. At the same size it is refused again
+ * for as long as the node stays under pressure, and the monitor falls behind. So a refusal
+ * halves the monitor's batches instead, down to [minBatchSize]: the next run evaluates the same documents in smaller
+ * searches. After [recovery] without another refusal the limit doubles, and once it is back to the configured sizes
+ * the monitor is forgotten.
+ *
+ * Only the monitors that were refused are tracked, so every other monitor keeps the configured sizes. The limits are
+ * kept in memory, so a restarted node starts again from the configured sizes.
+ */
+class DocLevelBatchLimits(
+    private val recovery: Duration = HALVED_BATCH_RECOVERY,
+    private val minBatchSize: Int = MIN_HALVED_BATCH_SIZE,
+    private val nowMillis: () -> Long = System::currentTimeMillis,
+) {
+    private data class Limit(val size: Int, val since: Long)
+
+    private val limits = ConcurrentHashMap<String, Limit>()
+
+    /** How many monitors run with halved batches. */
+    val halvedMonitors: Int
+        get() = limits.size
+
+    /**
+     * Returns the size [monitorId] may use for a batch whose configured size is [configured]: a shard read or a
+     * percolate search. [largestConfigured] is the larger of the two configured sizes, the point where a halved limit
+     * has doubled back and the monitor is forgotten.
+     */
+    fun sizeFor(monitorId: String, configured: Int, largestConfigured: Int): Int {
+        val limit = limits.computeIfPresent(monitorId) { _, limit -> recovered(monitorId, limit, largestConfigured) }
+        return if (limit == null) configured else min(configured, limit.size)
+    }
+
+    /**
+     * Halves the batches of [monitorId] after the node refused one of [refusedSize] documents, and returns the new
+     * limit. A refusal never raises a limit that is already lower, and it restarts the wait for the next doubling.
+     */
+    fun halve(monitorId: String, refusedSize: Int): Int {
+        val halved = max(minBatchSize, refusedSize / 2)
+        return limits.compute(monitorId) { _, limit -> Limit(min(halved, limit?.size ?: halved), nowMillis()) }!!.size
+    }
+
+    private fun recovered(monitorId: String, limit: Limit, largestConfigured: Int): Limit? {
+        val now = nowMillis()
+        val periods = (now - limit.since) / recovery.toMillis()
+        if (periods <= 0) {
+            return limit
+        }
+        val size = limit.size.toLong() shl periods.coerceAtMost(31).toInt()
+        if (size >= largestConfigured) {
+            log.info(
+                "Monitor $monitorId: no search refused for ${recovery.toMinutes()} minutes on this node, so it is " +
+                    "back to the configured batch sizes."
+            )
+            return null
+        }
+        log.info(
+            "Monitor $monitorId: no search refused for ${recovery.toMinutes()} minutes on this node, so its shard " +
+                "reads and percolate searches now take at most $size documents."
+        )
+        return Limit(size.toInt(), now)
+    }
+
+    private companion object {
+        val log: Logger = LogManager.getLogger(DocLevelBatchLimits::class.java)
+    }
 }
 
 fun distributeShards(

@@ -17,6 +17,7 @@ import org.opensearch.index.query.QueryStringQueryBuilder
 import org.opensearch.search.SearchHit
 import org.opensearch.search.SearchHits
 import org.opensearch.test.OpenSearchTestCase
+import java.time.Duration
 
 class MonitorFanOutUtilsTests : OpenSearchTestCase() {
     fun `test distribute few shards many nodes`() {
@@ -326,6 +327,98 @@ class MonitorFanOutUtilsTests : OpenSearchTestCase() {
         val percolator = FakePercolator(failing = setOf(10), transientAfter = 3)
 
         expectThrows(IllegalStateException::class.java) { isolate((0 until 100).toList(), percolator) }
+    }
+
+    fun `test a monitor that was never refused keeps the configured sizes`() {
+        val limits = DocLevelBatchLimits(nowMillis = { 0L })
+
+        assertEquals(5000, limits.sizeFor("m1", 5000, 5000))
+        assertEquals(0, limits.halvedMonitors)
+    }
+
+    fun `test a refused batch halves the monitor's reads and percolate searches`() {
+        val limits = DocLevelBatchLimits(nowMillis = { 0L })
+
+        assertEquals(2500, limits.halve("m1", 5000))
+        assertEquals(2500, limits.sizeFor("m1", 5000, 5000))
+        assertEquals(1, limits.halvedMonitors)
+    }
+
+    fun `test other monitors keep the configured sizes`() {
+        val limits = DocLevelBatchLimits(nowMillis = { 0L })
+
+        limits.halve("m1", 5000)
+
+        assertEquals(5000, limits.sizeFor("m2", 5000, 5000))
+    }
+
+    fun `test repeated refusals halve down to the floor`() {
+        val limits = DocLevelBatchLimits(minBatchSize = 1000, nowMillis = { 0L })
+
+        assertEquals(2500, limits.halve("m1", 5000))
+        assertEquals(1250, limits.halve("m1", 2500))
+        assertEquals(1000, limits.halve("m1", 1250))
+        assertEquals(1000, limits.halve("m1", 1000))
+    }
+
+    fun `test a refusal never raises a lower limit`() {
+        val limits = DocLevelBatchLimits(nowMillis = { 0L })
+
+        limits.halve("m1", 5000)
+
+        // A batch above the limit, such as the remainder of one shard plus a read of the next, is refused.
+        assertEquals(2500, limits.halve("m1", 50000))
+    }
+
+    fun `test a configured size below the limit is kept`() {
+        val limits = DocLevelBatchLimits(nowMillis = { 0L })
+
+        // A refused percolate search of 50000 documents halves the percolate cap, but the shard reads were
+        // already smaller.
+        limits.halve("m1", 50000)
+
+        assertEquals(10000, limits.sizeFor("m1", 10000, 50000))
+        assertEquals(25000, limits.sizeFor("m1", 50000, 50000))
+    }
+
+    fun `test the limit doubles after a quiet period and the monitor is then forgotten`() {
+        var now = 0L
+        val recovery = Duration.ofMinutes(15)
+        val limits = DocLevelBatchLimits(recovery = recovery, nowMillis = { now })
+        limits.halve("m1", 4000)
+
+        now = recovery.toMillis() - 1
+        assertEquals(2000, limits.sizeFor("m1", 5000, 5000))
+        now = recovery.toMillis()
+        assertEquals(4000, limits.sizeFor("m1", 5000, 5000))
+        now = 2 * recovery.toMillis()
+        assertEquals(5000, limits.sizeFor("m1", 5000, 5000))
+        assertEquals(0, limits.halvedMonitors)
+    }
+
+    fun `test a long quiet period doubles the limit once per period`() {
+        var now = 0L
+        val recovery = Duration.ofMinutes(15)
+        val limits = DocLevelBatchLimits(recovery = recovery, nowMillis = { now })
+        limits.halve("m1", 2000)
+
+        now = 3 * recovery.toMillis()
+
+        assertEquals(8000, limits.sizeFor("m1", 50000, 50000))
+    }
+
+    fun `test a refusal restarts the wait for the next doubling`() {
+        var now = 0L
+        val recovery = Duration.ofMinutes(15)
+        val limits = DocLevelBatchLimits(recovery = recovery, nowMillis = { now })
+        limits.halve("m1", 5000)
+
+        now = recovery.toMillis() - 1
+        limits.halve("m1", 2500)
+        now = recovery.toMillis()
+        assertEquals(1250, limits.sizeFor("m1", 5000, 5000))
+        now = 2 * recovery.toMillis() - 1
+        assertEquals(2500, limits.sizeFor("m1", 5000, 5000))
     }
 
     private fun isolate(docs: List<Int>, percolator: FakePercolator): PercolateIsolation<Int> = runBlocking {

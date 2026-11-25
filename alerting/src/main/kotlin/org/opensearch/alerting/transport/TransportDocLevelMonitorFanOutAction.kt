@@ -24,6 +24,8 @@ import org.opensearch.action.search.SearchResponse
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
 import org.opensearch.alerting.AlertService
+import org.opensearch.alerting.DocLevelBatchLimits
+import org.opensearch.alerting.HALVED_BATCH_RECOVERY
 import org.opensearch.alerting.MAX_ISOLATED_PERCOLATE_FAILURES
 import org.opensearch.alerting.MonitorRunnerService
 import org.opensearch.alerting.TriggerService
@@ -68,6 +70,7 @@ import org.opensearch.alerting.util.getActionExecutionPolicy
 import org.opensearch.alerting.util.getCancelAfterTimeInterval
 import org.opensearch.alerting.util.isActiveResponseMonitor
 import org.opensearch.alerting.util.isAllowed
+import org.opensearch.alerting.util.isMemoryRefusal
 import org.opensearch.alerting.util.isNodeUnavailableFailure
 import org.opensearch.alerting.util.isTestAction
 import org.opensearch.alerting.util.isTransientFailure
@@ -141,6 +144,7 @@ import java.io.IOException
 import java.time.Instant
 import java.util.UUID
 import java.util.stream.Collectors
+import kotlin.math.max
 
 private val log = LogManager.getLogger(TransportDocLevelMonitorFanOutAction::class.java)
 private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
@@ -176,6 +180,10 @@ class TransportDocLevelMonitorFanOutAction
     @Volatile var retryPolicy = BackoffPolicy.constantBackoff(ALERT_BACKOFF_MILLIS.get(settings), ALERT_BACKOFF_COUNT.get(settings))
     @Volatile var allowList: List<String> = DestinationSettings.ALLOW_LIST.get(settings)
     @Volatile var fetchOnlyQueryFieldNames = DOC_LEVEL_MONITOR_FETCH_ONLY_QUERY_FIELDS_ENABLED.get(settings)
+
+    // Halved batch sizes of the monitors whose searches this node refused for want of memory. The action is a
+    // node-wide singleton, so the limits outlive a single run
+    private val batchLimits = DocLevelBatchLimits()
 
     // When finding history is disabled, findings are not persisted to the findings index (e.g. .opensearch-sap-*-findings-*).
     // Enrichment and trigger evaluation still run; only the write/auto-creation of the findings index is skipped.
@@ -839,6 +847,9 @@ class TransportDocLevelMonitorFanOutAction
         var matchFilter = matchFilterOf(monitor)
         for (shardId in shardList) {
             val shard = shardId.toString()
+            // Size of the shard read in progress, so a read the node refuses for want of memory halves the
+            // monitor's batches. Null outside a read: the other searches here are small.
+            var readInFlight: Int? = null
             try {
                 val prevSeqNo = indexExecutionCtx.lastRunContext[shard].toString().toLongOrNull()
                 val from = prevSeqNo ?: SequenceNumbers.NO_OPS_PERFORMED
@@ -870,7 +881,7 @@ class TransportDocLevelMonitorFanOutAction
                     if (isFanOutTimeEnded(endTime)) { // process percolate queries and exit
                         if (
                             transformedDocs.isNotEmpty() &&
-                            shouldPerformPercolateQueryAndFlushInMemoryDocs(transformedDocs.size)
+                            shouldPerformPercolateQueryAndFlushInMemoryDocs(monitor, transformedDocs.size)
                         ) {
                             gap += percolateBatchAndCommitProgress(
                                 monitor,
@@ -893,6 +904,8 @@ class TransportDocLevelMonitorFanOutAction
                         )
                         break
                     }
+                    val readSize = readSize(monitor)
+                    readInFlight = readSize
                     val hits = try {
                         searchShard(
                             monitor,
@@ -900,6 +913,7 @@ class TransportDocLevelMonitorFanOutAction
                             shard,
                             currentSeqNo,
                             maxSeqNo,
+                            readSize,
                             indexExecutionCtx.docIds,
                             fieldsToBeQueried,
                             matchFilter
@@ -922,10 +936,12 @@ class TransportDocLevelMonitorFanOutAction
                             shard,
                             currentSeqNo,
                             maxSeqNo,
+                            readSize,
                             indexExecutionCtx.docIds,
                             fieldsToBeQueried
                         )
                     }
+                    readInFlight = null
 
                     if (hits.hits.isEmpty()) {
                         if (matchFilter != null) {
@@ -954,7 +970,7 @@ class TransportDocLevelMonitorFanOutAction
 
                     if (
                         transformedDocs.isNotEmpty() &&
-                        shouldPerformPercolateQueryAndFlushInMemoryDocs(transformedDocs.size)
+                        shouldPerformPercolateQueryAndFlushInMemoryDocs(monitor, transformedDocs.size)
                     ) {
                         val batchGap = percolateBatchAndCommitProgress(
                             monitor,
@@ -998,6 +1014,14 @@ class TransportDocLevelMonitorFanOutAction
                     // Expected during WCS dynamic mapping bootstrap; resolves itself as data arrives.
                     log.debug(message, e)
                 } else if (isTransientFailure(e)) {
+                    val refusedRead = readInFlight
+                    if (refusedRead != null && isMemoryRefusal(e)) {
+                        halveBatches(
+                            monitor,
+                            "read of $refusedRead document(s) from [${indexExecutionCtx.concreteIndexName}][$shard]",
+                            refusedRead
+                        )
+                    }
                     // Nothing is lost here: the shard was not read to the end, but its sequence number has
                     // only been advanced as far as the documents that percolated, so the next run resumes
                     // where this one stopped. It is therefore not a coverage gap, just a slower run -- hence a
@@ -1010,7 +1034,7 @@ class TransportDocLevelMonitorFanOutAction
             }
             if (
                 transformedDocs.isNotEmpty() &&
-                shouldPerformPercolateQueryAndFlushInMemoryDocs(transformedDocs.size)
+                shouldPerformPercolateQueryAndFlushInMemoryDocs(monitor, transformedDocs.size)
             ) {
                 gap += percolateBatchAndCommitProgress(
                     monitor,
@@ -1082,6 +1106,9 @@ class TransportDocLevelMonitorFanOutAction
                         "(${rootCauseMessage(e)}). Their sequence numbers stay uncommitted, " +
                         "so the next run evaluates them again."
                 )
+                if (isMemoryRefusal(e)) {
+                    halveBatches(monitor, "percolate search for $batchSize document(s)", batchSize)
+                }
                 return DetectionCoverageGap(deferredDocs = batchSize)
             }
             return percolateInPartsAndCommitProgress(
@@ -1364,6 +1391,7 @@ class TransportDocLevelMonitorFanOutAction
         shard: String,
         prevSeqNo: Long?,
         maxSeqNo: Long,
+        size: Int,
         docIds: List<String>? = null,
         fieldsToFetch: List<String>,
         matchFilter: QueryBuilder? = null,
@@ -1398,7 +1426,7 @@ class TransportDocLevelMonitorFanOutAction
                     .sort("_seq_no", SortOrder.ASC)
                     .seqNoAndPrimaryTerm(true)
                     .query(boolQueryBuilder)
-                    .size(docLevelMonitorShardFetchSize)
+                    .size(size)
             )
 
         val cancelTimeout = getCancelAfterTimeInterval()
@@ -1524,10 +1552,11 @@ class TransportDocLevelMonitorFanOutAction
     }
 
     private fun shouldPerformPercolateQueryAndFlushInMemoryDocs(
+        monitor: Monitor,
         numDocs: Int
     ): Boolean {
         return isInMemoryDocsSizeExceedingMemoryLimit(docsSizeOfBatchInBytes) ||
-            isInMemoryNumDocsExceedingMaxDocsPerPercolateQueryLimit(numDocs)
+            isInMemoryNumDocsExceedingMaxDocsPerPercolateQueryLimit(monitor, numDocs)
     }
 
     /**
@@ -1543,9 +1572,43 @@ class TransportDocLevelMonitorFanOutAction
         return docsBytesSize > thresholdBytes
     }
 
-    private fun isInMemoryNumDocsExceedingMaxDocsPerPercolateQueryLimit(numDocs: Int): Boolean {
-        var maxNumDocsThreshold = percQueryMaxNumDocsInMemory
-        return numDocs >= maxNumDocsThreshold
+    private fun isInMemoryNumDocsExceedingMaxDocsPerPercolateQueryLimit(monitor: Monitor, numDocs: Int): Boolean {
+        return numDocs >= percolateCap(monitor)
+    }
+
+    /** How many documents [monitor] reads from a shard at a time on this node. */
+    private fun readSize(monitor: Monitor): Int = batchSize(monitor, docLevelMonitorShardFetchSize)
+
+    /** How many documents [monitor] evaluates in one percolate search on this node, at most. */
+    private fun percolateCap(monitor: Monitor): Int = batchSize(monitor, percQueryMaxNumDocsInMemory)
+
+    /**
+     * Returns [configured], or less when this node refused searches of [monitor] for want of memory. Both batch sizes
+     * share the monitor's limit, so a halved monitor never reads more documents at a time than one percolate search
+     * takes. A monitor that is not stored, a dry run, is not tracked.
+     */
+    private fun batchSize(monitor: Monitor, configured: Int): Int {
+        if (monitor.id == Monitor.NO_ID) {
+            return configured
+        }
+        val largestConfigured = max(docLevelMonitorShardFetchSize, percQueryMaxNumDocsInMemory)
+        return batchLimits.sizeFor(monitor.id, configured, largestConfigured)
+    }
+
+    /**
+     * Halves the batches of [monitor] on this node after the node refused its [refused] for want of memory, so the
+     * next run evaluates the same documents in smaller searches instead of repeating the refused one.
+     */
+    private fun halveBatches(monitor: Monitor, refused: String, refusedSize: Int) {
+        if (monitor.id == Monitor.NO_ID) {
+            return
+        }
+        val limit = batchLimits.halve(monitor.id, refusedSize)
+        log.warn(
+            "Monitor ${monitor.id}: this node refused its $refused for want of memory, so its shard reads and " +
+                "percolate searches on this node now take at most $limit documents. The limit doubles after " +
+                "${HALVED_BATCH_RECOVERY.toMinutes()} minutes without another refusal."
+        )
     }
 
     /**
