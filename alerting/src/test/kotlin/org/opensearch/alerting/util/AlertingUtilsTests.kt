@@ -453,6 +453,38 @@ class AlertingUtilsTests : OpenSearchTestCase() {
         assertTrue(isTransientFailure(IndexNotFoundException("some-index")))
     }
 
+    fun `test a backpressure cancellation is a memory refusal`() {
+        assertTrue(isMemoryRefusal(TaskCancelledException("cancelled task with reason: heap usage exceeded")))
+        assertTrue(isMemoryRefusal(cancelledPercolateSearch(5000)))
+    }
+
+    fun `test a tripped circuit breaker is a memory refusal`() {
+        val tripped = CircuitBreakingException("[parent] Data too large", 1024, 512, CircuitBreaker.Durability.TRANSIENT)
+        assertTrue(isMemoryRefusal(tripped))
+    }
+
+    fun `test a cancelled shard read is a memory refusal`() {
+        // What the shard read of a doc-level monitor throws when search backpressure cancels it.
+        val failed = SearchPhaseExecutionException(
+            "query",
+            "all shards failed",
+            arrayOf(ShardSearchFailure(TaskCancelledException("cancelled task with reason: heap usage exceeded")))
+        )
+        assertTrue(isMemoryRefusal(failed))
+    }
+
+    fun `test a converted cancellation is a memory refusal`() {
+        assertTrue(isMemoryRefusal(AlertingException.wrap(TaskCancelledException("cancelled task")) as Exception))
+    }
+
+    fun `test transient failures that do not depend on the search size are not memory refusals`() {
+        // A smaller search does not help a full queue or a missing index, so they must not halve the batches.
+        assertFalse(isMemoryRefusal(OpenSearchRejectedExecutionException("rejected")))
+        assertFalse(isMemoryRefusal(IndexClosedException(Index("some-index", "uuid"))))
+        assertFalse(isMemoryRefusal(IndexNotFoundException("some-index")))
+        assertFalse(isMemoryRefusal(IllegalStateException("boom")))
+    }
+
     fun `test closed query index is transient through the percolate search wrapper`() {
         // The shape that reaches the monitor when the detector query index is closed: the batch must be
         // deferred, not abandoned, so reopening the index does not cost the documents indexed meanwhile.

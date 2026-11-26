@@ -404,16 +404,17 @@ fun wrapKeepingNodeUnavailableCause(e: Exception): OpenSearchException {
     }
 }
 
-/**
- * Class names recorded by `AlertingException.wrap()` for the transient failures below, for the same reason
- * [NODE_UNAVAILABLE_EXCEPTION_NAMES] exists: the original type does not survive flattening.
- */
-private val TRANSIENT_EXCEPTION_NAMES = setOf(
-    TaskCancelledException::class.java.name,
-    CircuitBreakingException::class.java.name,
-    OpenSearchRejectedExecutionException::class.java.name,
-    IndexClosedException::class.java.name,
-    IndexNotFoundException::class.java.name
+/** The failures [isMemoryRefusal] accepts: the node refused the work for want of memory. */
+private val MEMORY_REFUSAL_TYPES = listOf(
+    TaskCancelledException::class.java,
+    CircuitBreakingException::class.java
+)
+
+/** The failures [isTransientFailure] accepts. */
+private val TRANSIENT_FAILURE_TYPES = MEMORY_REFUSAL_TYPES + listOf(
+    OpenSearchRejectedExecutionException::class.java,
+    IndexClosedException::class.java,
+    IndexNotFoundException::class.java
 )
 
 /**
@@ -450,30 +451,42 @@ fun rootCauseMessage(e: Throwable): String {
  * per-shard causes carry the real reason. Only the *first* shard failure is wired into the exception's own
  * cause chain, so every shard failure is inspected too: the cancelled shard need not be the first one.
  */
-fun isTransientFailure(e: Throwable): Boolean {
+fun isTransientFailure(e: Throwable): Boolean = hasFailureOfType(e, TRANSIENT_FAILURE_TYPES)
+
+/**
+ * Returns true when [e], or any cause it wraps, says the node refused the work for want of memory:
+ * `SearchBackpressureService` cancelled the task in enforced mode, or a circuit breaker tripped. Unlike the
+ * other failures [isTransientFailure] accepts, these depend on the size of the work, so a smaller search may
+ * get through where this one did not.
+ */
+fun isMemoryRefusal(e: Throwable): Boolean = hasFailureOfType(e, MEMORY_REFUSAL_TYPES)
+
+/**
+ * Returns true when [e], any cause it wraps, or any shard failure of a search it wraps is one of [types].
+ *
+ * A failure already converted by `AlertingException.wrap()` is recognised by the class name that conversion
+ * recorded at the start of its message, for the same reason [NODE_UNAVAILABLE_EXCEPTION_NAMES] exists: the
+ * original type does not survive flattening.
+ */
+private fun hasFailureOfType(e: Throwable, types: List<Class<out Throwable>>): Boolean {
     var cause: Throwable? = e
     var depth = 0
     while (cause != null && depth++ < MAX_CAUSE_CHAIN_DEPTH) {
-        if (cause is TaskCancelledException ||
-            cause is CircuitBreakingException ||
-            cause is OpenSearchRejectedExecutionException ||
-            cause is IndexClosedException ||
-            cause is IndexNotFoundException
-        ) {
-            return true
-        }
-        val message = cause.message
-        if (message != null && TRANSIENT_EXCEPTION_NAMES.any { message.startsWith("$it:") }) {
-            return true
-        }
         val current = cause
+        if (types.any { it.isInstance(current) }) {
+            return true
+        }
+        val message = current.message
+        if (message != null && types.any { message.startsWith("${it.name}:") }) {
+            return true
+        }
         if (current is SearchPhaseExecutionException &&
-            current.shardFailures().any { failure -> failure.cause?.let { isTransientFailure(it) } == true }
+            current.shardFailures().any { failure -> failure.cause?.let { hasFailureOfType(it, types) } == true }
         ) {
             return true
         }
-        val next = cause.cause
-        cause = if (next === cause) null else next
+        val next = current.cause
+        cause = if (next === current) null else next
     }
     return false
 }
