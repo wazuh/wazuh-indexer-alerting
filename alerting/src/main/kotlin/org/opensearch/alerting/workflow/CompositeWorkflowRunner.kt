@@ -238,7 +238,12 @@ object CompositeWorkflowRunner : WorkflowRunner() {
         } catch (e: Exception) {
             // We can't save ERROR alerts to the index here as we don't know if there are existing ACTIVE alerts
             val id = if (workflow.id.trim().isEmpty()) "_na_" else workflow.id
-            logger.error("Error loading current chained alerts for workflow: $id", e)
+            if (isNodeUnavailableFailure(e)) {
+                // The node is shutting down or a peer has gone away: the run is abandoned, not failed.
+                logger.debug("Skipped running chained alert triggers for workflow $id: node is closing", e)
+            } else {
+                logger.error("Error loading current chained alerts for workflow: $id", e)
+            }
             return WorkflowRunResult(
                 workflowId = workflow.id,
                 workflowName = workflow.name,
@@ -246,7 +251,7 @@ object CompositeWorkflowRunner : WorkflowRunner() {
                 executionStartTime = workflowExecutionStartTime,
                 executionEndTime = Instant.now(),
                 executionId = executionId,
-                error = AlertingException.wrap(e),
+                error = wrapKeepingNodeUnavailableCause(e),
                 triggerResults = emptyMap()
             )
         }
