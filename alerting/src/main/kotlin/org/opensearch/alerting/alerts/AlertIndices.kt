@@ -43,6 +43,7 @@ import org.opensearch.alerting.settings.AlertingSettings.Companion.FINDING_HISTO
 import org.opensearch.alerting.settings.AlertingSettings.Companion.REQUEST_TIMEOUT
 import org.opensearch.alerting.util.CommentsUtils
 import org.opensearch.alerting.util.IndexUtils
+import org.opensearch.alerting.util.wrapKeepingNodeUnavailableCause
 import org.opensearch.cluster.ClusterChangedEvent
 import org.opensearch.cluster.ClusterStateListener
 import org.opensearch.cluster.metadata.IndexMetadata
@@ -54,7 +55,6 @@ import org.opensearch.common.xcontent.XContentHelper
 import org.opensearch.common.xcontent.XContentType
 import org.opensearch.commons.alerting.model.Alert
 import org.opensearch.commons.alerting.model.DataSources
-import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.xcontent.NamedXContentRegistry
 import org.opensearch.core.xcontent.XContentParser
@@ -406,7 +406,8 @@ class AlertIndices(
             if (ExceptionsHelper.unwrapCause(t) is ResourceAlreadyExistsException) {
                 true
             } else {
-                throw AlertingException.wrap(t)
+                // Plain wrap() would flatten a shutdown seen through a transport wrapper and hide it from the callers above.
+                throw wrapKeepingNodeUnavailableCause(t)
             }
         }
     }
